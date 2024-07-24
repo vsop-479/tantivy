@@ -8,7 +8,7 @@ use common::{ByteCount, DateTime, HasLen, OwnedBytes};
 use crate::column::{BytesColumn, Column, StrColumn};
 use crate::column_values::{monotonic_map_column, StrictlyMonotonicFn};
 use crate::columnar::ColumnType;
-use crate::{Cardinality, ColumnIndex, NumericalType};
+use crate::{Cardinality, ColumnIndex, ColumnValues, NumericalType, Version};
 
 #[derive(Clone)]
 pub enum DynamicColumn {
@@ -26,14 +26,14 @@ impl fmt::Debug for DynamicColumn {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "[{} {} |", self.get_cardinality(), self.column_type())?;
         match self {
-            DynamicColumn::Bool(col) => write!(f, " {:?}", col)?,
-            DynamicColumn::I64(col) => write!(f, " {:?}", col)?,
-            DynamicColumn::U64(col) => write!(f, " {:?}", col)?,
-            DynamicColumn::F64(col) => write!(f, "{:?}", col)?,
-            DynamicColumn::IpAddr(col) => write!(f, "{:?}", col)?,
-            DynamicColumn::DateTime(col) => write!(f, "{:?}", col)?,
-            DynamicColumn::Bytes(col) => write!(f, "{:?}", col)?,
-            DynamicColumn::Str(col) => write!(f, "{:?}", col)?,
+            DynamicColumn::Bool(col) => write!(f, " {col:?}")?,
+            DynamicColumn::I64(col) => write!(f, " {col:?}")?,
+            DynamicColumn::U64(col) => write!(f, " {col:?}")?,
+            DynamicColumn::F64(col) => write!(f, "{col:?}")?,
+            DynamicColumn::IpAddr(col) => write!(f, "{col:?}")?,
+            DynamicColumn::DateTime(col) => write!(f, "{col:?}")?,
+            DynamicColumn::Bytes(col) => write!(f, "{col:?}")?,
+            DynamicColumn::Str(col) => write!(f, "{col:?}")?,
         }
         write!(f, "]")
     }
@@ -228,10 +228,11 @@ static_dynamic_conversions!(StrColumn, Str);
 static_dynamic_conversions!(BytesColumn, Bytes);
 static_dynamic_conversions!(Column<Ipv6Addr>, IpAddr);
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DynamicColumnHandle {
     pub(crate) file_slice: FileSlice,
     pub(crate) column_type: ColumnType,
+    pub(crate) format_version: Version,
 }
 
 impl DynamicColumnHandle {
@@ -247,7 +248,12 @@ impl DynamicColumnHandle {
     }
 
     /// Returns the `u64` fast field reader reader associated with `fields` of types
-    /// Str, u64, i64, f64, or datetime.
+    /// Str, u64, i64, f64, bool, ip, or datetime.
+    ///
+    /// Notice that for IpAddr, the fastfield reader will return the u64 representation of the
+    /// IpAddr.
+    /// In order to convert to u128 back cast to `CompactSpaceU64Accessor` and call
+    /// `compact_to_u128`.
     ///
     /// If not, the fastfield reader will returns the u64-value associated with the original
     /// FastValue.
@@ -255,13 +261,24 @@ impl DynamicColumnHandle {
         let column_bytes = self.file_slice.read_bytes()?;
         match self.column_type {
             ColumnType::Str | ColumnType::Bytes => {
-                let column: BytesColumn = crate::column::open_column_bytes(column_bytes)?;
+                let column: BytesColumn =
+                    crate::column::open_column_bytes(column_bytes, self.format_version)?;
                 Ok(Some(column.term_ord_column))
             }
-            ColumnType::Bool => Ok(None),
-            ColumnType::IpAddr => Ok(None),
-            ColumnType::I64 | ColumnType::U64 | ColumnType::F64 | ColumnType::DateTime => {
-                let column = crate::column::open_column_u64::<u64>(column_bytes)?;
+            ColumnType::IpAddr => {
+                let column = crate::column::open_column_u128_as_compact_u64(
+                    column_bytes,
+                    self.format_version,
+                )?;
+                Ok(Some(column))
+            }
+            ColumnType::Bool
+            | ColumnType::I64
+            | ColumnType::U64
+            | ColumnType::F64
+            | ColumnType::DateTime => {
+                let column =
+                    crate::column::open_column_u64::<u64>(column_bytes, self.format_version)?;
                 Ok(Some(column))
             }
         }
@@ -269,15 +286,31 @@ impl DynamicColumnHandle {
 
     fn open_internal(&self, column_bytes: OwnedBytes) -> io::Result<DynamicColumn> {
         let dynamic_column: DynamicColumn = match self.column_type {
-            ColumnType::Bytes => crate::column::open_column_bytes(column_bytes)?.into(),
-            ColumnType::Str => crate::column::open_column_str(column_bytes)?.into(),
-            ColumnType::I64 => crate::column::open_column_u64::<i64>(column_bytes)?.into(),
-            ColumnType::U64 => crate::column::open_column_u64::<u64>(column_bytes)?.into(),
-            ColumnType::F64 => crate::column::open_column_u64::<f64>(column_bytes)?.into(),
-            ColumnType::Bool => crate::column::open_column_u64::<bool>(column_bytes)?.into(),
-            ColumnType::IpAddr => crate::column::open_column_u128::<Ipv6Addr>(column_bytes)?.into(),
+            ColumnType::Bytes => {
+                crate::column::open_column_bytes(column_bytes, self.format_version)?.into()
+            }
+            ColumnType::Str => {
+                crate::column::open_column_str(column_bytes, self.format_version)?.into()
+            }
+            ColumnType::I64 => {
+                crate::column::open_column_u64::<i64>(column_bytes, self.format_version)?.into()
+            }
+            ColumnType::U64 => {
+                crate::column::open_column_u64::<u64>(column_bytes, self.format_version)?.into()
+            }
+            ColumnType::F64 => {
+                crate::column::open_column_u64::<f64>(column_bytes, self.format_version)?.into()
+            }
+            ColumnType::Bool => {
+                crate::column::open_column_u64::<bool>(column_bytes, self.format_version)?.into()
+            }
+            ColumnType::IpAddr => {
+                crate::column::open_column_u128::<Ipv6Addr>(column_bytes, self.format_version)?
+                    .into()
+            }
             ColumnType::DateTime => {
-                crate::column::open_column_u64::<DateTime>(column_bytes)?.into()
+                crate::column::open_column_u64::<DateTime>(column_bytes, self.format_version)?
+                    .into()
             }
         };
         Ok(dynamic_column)

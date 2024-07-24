@@ -2,7 +2,7 @@
 //! ready for indexing. This is an seperate crate from tantivy, so implementors don't need to update
 //! for each new tantivy version.
 //!
-//! To add support for a tokenizer, implement the [`Tokenizer`](crate::Tokenizer) trait.
+//! To add support for a tokenizer, implement the [`Tokenizer`] trait.
 //! Checkout the [tantivy repo](https://github.com/quickwit-oss/tantivy/tree/main/src/tokenizer) for some examples.
 
 use std::borrow::{Borrow, BorrowMut};
@@ -34,9 +34,20 @@ impl Default for Token {
             offset_from: 0,
             offset_to: 0,
             position: usize::MAX,
-            text: String::with_capacity(200),
+            text: String::new(),
             position_length: 1,
         }
+    }
+}
+
+impl Token {
+    /// reset to default
+    pub fn reset(&mut self) {
+        self.offset_from = 0;
+        self.offset_to = 0;
+        self.position = usize::MAX;
+        self.text.clear();
+        self.position_length = 1;
     }
 }
 
@@ -46,33 +57,28 @@ pub trait Tokenizer: 'static + Clone + Send + Sync {
     /// The token stream returned by this Tokenizer.
     type TokenStream<'a>: TokenStream;
     /// Creates a token stream for a given `str`.
-    fn token_stream<'a>(&self, text: &'a str) -> Self::TokenStream<'a>;
-}
-
-/// A boxable `Tokenizer`, with its `TokenStream` type erased.
-pub trait BoxableTokenizer: 'static + Send + Sync {
-    /// Creates a boxed token stream for a given `str`.
-    fn box_token_stream<'a>(&self, text: &'a str) -> BoxTokenStream<'a>;
-    /// Clone this tokenizer.
-    fn box_clone(&self) -> Box<dyn BoxableTokenizer>;
-}
-
-impl<T: Tokenizer> BoxableTokenizer for T {
-    fn box_token_stream<'a>(&self, text: &'a str) -> BoxTokenStream<'a> {
-        self.token_stream(text).into()
-    }
-    fn box_clone(&self) -> Box<dyn BoxableTokenizer> {
-        Box::new(self.clone())
-    }
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a>;
 }
 
 /// Simple wrapper of `Box<dyn TokenStream + 'a>`.
 pub struct BoxTokenStream<'a>(Box<dyn TokenStream + 'a>);
 
-impl<'a, T> From<T> for BoxTokenStream<'a>
-where T: TokenStream + 'a
-{
-    fn from(token_stream: T) -> BoxTokenStream<'a> {
+impl<'a> TokenStream for BoxTokenStream<'a> {
+    fn advance(&mut self) -> bool {
+        self.0.advance()
+    }
+
+    fn token(&self) -> &Token {
+        self.0.token()
+    }
+
+    fn token_mut(&mut self) -> &mut Token {
+        self.0.token_mut()
+    }
+}
+
+impl<'a> BoxTokenStream<'a> {
+    pub fn new<T: TokenStream + 'a>(token_stream: T) -> BoxTokenStream<'a> {
         BoxTokenStream(Box::new(token_stream))
     }
 }

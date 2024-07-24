@@ -4,8 +4,8 @@
 //! order to be handled in the `Store`.
 //!
 //! Internally, documents (or rather their stored fields) are serialized to a buffer.
-//! When the buffer exceeds `block_size` (defaults to 16K), the buffer is compressed using `brotli`,
-//! `LZ4` or `snappy` and the resulting block is written to disk.
+//! When the buffer exceeds `block_size` (defaults to 16K), the buffer is compressed
+//! using LZ4 or Zstd and the resulting block is written to disk.
 //!
 //! One can then request for a specific `DocId`.
 //! A skip list helps navigating to the right block,
@@ -48,12 +48,6 @@ pub(crate) const DOC_STORE_VERSION: u32 = 1;
 #[cfg(feature = "lz4-compression")]
 mod compression_lz4_block;
 
-#[cfg(feature = "brotli-compression")]
-mod compression_brotli;
-
-#[cfg(feature = "snappy-compression")]
-mod compression_snap;
-
 #[cfg(feature = "zstd-compression")]
 mod compression_zstd_block;
 
@@ -65,8 +59,10 @@ pub mod tests {
     use super::*;
     use crate::directory::{Directory, RamDirectory, WritePtr};
     use crate::fastfield::AliveBitSet;
-    use crate::schema::{self, Document, Schema, TextFieldIndexing, TextOptions, STORED, TEXT};
-    use crate::{Index, Term};
+    use crate::schema::{
+        self, Schema, TantivyDocument, TextFieldIndexing, TextOptions, Value, STORED, TEXT,
+    };
+    use crate::{Index, IndexWriter, Term};
 
     const LOREM: &str = "Doc Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do \
                          eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad \
@@ -94,9 +90,9 @@ pub mod tests {
             let mut store_writer =
                 StoreWriter::new(writer, compressor, blocksize, separate_thread).unwrap();
             for i in 0..num_docs {
-                let mut doc = Document::default();
-                doc.add_field_value(field_body, LOREM.to_string());
-                doc.add_field_value(field_title, format!("Doc {i}"));
+                let mut doc = TantivyDocument::default();
+                doc.add_text(field_body, LOREM);
+                doc.add_text(field_title, format!("Doc {i}"));
                 store_writer.store(&doc, &schema).unwrap();
             }
             store_writer.close().unwrap();
@@ -122,21 +118,28 @@ pub mod tests {
         let store = StoreReader::open(store_file, 10)?;
         for i in 0..NUM_DOCS as u32 {
             assert_eq!(
-                *store
-                    .get(i)?
+                store
+                    .get::<TantivyDocument>(i)?
                     .get_first(field_title)
                     .unwrap()
-                    .as_text()
+                    .as_value()
+                    .as_str()
                     .unwrap(),
-                format!("Doc {}", i)
+                format!("Doc {i}")
             );
         }
 
-        for (_, doc) in store.iter(Some(&alive_bitset)).enumerate() {
+        for doc in store.iter::<TantivyDocument>(Some(&alive_bitset)) {
             let doc = doc?;
-            let title_content = doc.get_first(field_title).unwrap().as_text().unwrap();
+            let title_content = doc
+                .get_first(field_title)
+                .unwrap()
+                .as_value()
+                .as_str()
+                .unwrap()
+                .to_string();
             if !title_content.starts_with("Doc ") {
-                panic!("unexpected title_content {}", title_content);
+                panic!("unexpected title_content {title_content}");
             }
 
             let id = title_content
@@ -145,7 +148,7 @@ pub mod tests {
                 .parse::<u32>()
                 .unwrap();
             if alive_bitset.is_deleted(id) {
-                panic!("unexpected deleted document {}", id);
+                panic!("unexpected deleted document {id}");
             }
         }
 
@@ -168,18 +171,18 @@ pub mod tests {
         for i in 0..NUM_DOCS as u32 {
             assert_eq!(
                 *store
-                    .get(i)?
+                    .get::<TantivyDocument>(i)?
                     .get_first(field_title)
                     .unwrap()
-                    .as_text()
+                    .as_str()
                     .unwrap(),
-                format!("Doc {}", i)
+                format!("Doc {i}")
             );
         }
-        for (i, doc) in store.iter(None).enumerate() {
+        for (i, doc) in store.iter::<TantivyDocument>(None).enumerate() {
             assert_eq!(
-                *doc?.get_first(field_title).unwrap().as_text().unwrap(),
-                format!("Doc {}", i)
+                *doc?.get_first(field_title).unwrap().as_str().unwrap(),
+                format!("Doc {i}")
             );
         }
         Ok(())
@@ -199,16 +202,6 @@ pub mod tests {
     #[test]
     fn test_store_lz4_block() -> crate::Result<()> {
         test_store(Compressor::Lz4, BLOCK_SIZE, true)
-    }
-    #[cfg(feature = "snappy-compression")]
-    #[test]
-    fn test_store_snap() -> crate::Result<()> {
-        test_store(Compressor::Snappy, BLOCK_SIZE, true)
-    }
-    #[cfg(feature = "brotli-compression")]
-    #[test]
-    fn test_store_brotli() -> crate::Result<()> {
-        test_store(Compressor::Brotli, BLOCK_SIZE, true)
     }
 
     #[cfg(feature = "zstd-compression")]
@@ -238,7 +231,7 @@ pub mod tests {
         let index = index_builder.create_in_ram()?;
 
         {
-            let mut index_writer = index.writer_for_tests().unwrap();
+            let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
             index_writer.add_document(doc!(text_field=> "deleteme"))?;
             index_writer.add_document(doc!(text_field=> "deletemenot"))?;
             index_writer.add_document(doc!(text_field=> "deleteme"))?;
@@ -252,17 +245,17 @@ pub mod tests {
         let searcher = index.reader()?.searcher();
         let reader = searcher.segment_reader(0);
         let store = reader.get_store_reader(10)?;
-        for doc in store.iter(reader.alive_bitset()) {
+        for doc in store.iter::<TantivyDocument>(reader.alive_bitset()) {
             assert_eq!(
-                *doc?.get_first(text_field).unwrap().as_text().unwrap(),
+                *doc?.get_first(text_field).unwrap().as_str().unwrap(),
                 "deletemenot".to_string()
             );
         }
         Ok(())
     }
 
-    #[cfg(feature = "snappy-compression")]
     #[cfg(feature = "lz4-compression")]
+    #[cfg(feature = "zstd-compression")]
     #[test]
     fn test_merge_with_changed_compressor() -> crate::Result<()> {
         let mut schema_builder = schema::Schema::builder();
@@ -274,7 +267,7 @@ pub mod tests {
         let mut index = index_builder.create_in_ram().unwrap();
         index.settings_mut().docstore_compression = Compressor::Lz4;
         {
-            let mut index_writer = index.writer_for_tests().unwrap();
+            let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
             // put enough data create enough blocks in the doc store to be considered for stacking
             for _ in 0..200 {
                 index_writer.add_document(doc!(text_field=> LOREM))?;
@@ -294,13 +287,13 @@ pub mod tests {
         );
         // Change compressor, this disables stacking on merging
         let index_settings = index.settings_mut();
-        index_settings.docstore_compression = Compressor::Snappy;
+        index_settings.docstore_compression = Compressor::Zstd(Default::default());
         // Merging the segments
         {
             let segment_ids = index
                 .searchable_segment_ids()
                 .expect("Searchable segments failed.");
-            let mut index_writer = index.writer_for_tests().unwrap();
+            let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
             assert!(index_writer.merge(&segment_ids).wait().is_ok());
             assert!(index_writer.wait_merging_threads().is_ok());
         }
@@ -310,13 +303,16 @@ pub mod tests {
         let reader = searcher.segment_readers().iter().last().unwrap();
         let store = reader.get_store_reader(10).unwrap();
 
-        for doc in store.iter(reader.alive_bitset()).take(50) {
+        for doc in store
+            .iter::<TantivyDocument>(reader.alive_bitset())
+            .take(50)
+        {
             assert_eq!(
-                *doc?.get_first(text_field).unwrap().as_text().unwrap(),
+                *doc?.get_first(text_field).and_then(|v| v.as_str()).unwrap(),
                 LOREM.to_string()
             );
         }
-        assert_eq!(store.decompressor(), Decompressor::Snappy);
+        assert_eq!(store.decompressor(), Decompressor::Zstd);
 
         Ok(())
     }
@@ -347,7 +343,7 @@ pub mod tests {
         // Merging the segments
         {
             let segment_ids = index.searchable_segment_ids()?;
-            let mut index_writer = index.writer_for_tests()?;
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
             index_writer.merge(&segment_ids).wait()?;
             index_writer.wait_merging_threads()?;
         }
@@ -371,6 +367,7 @@ mod bench {
     use super::tests::write_lorem_ipsum_store;
     use crate::directory::{Directory, RamDirectory};
     use crate::store::{Compressor, StoreReader};
+    use crate::TantivyDocument;
 
     #[bench]
     #[cfg(feature = "mmap")]
@@ -402,6 +399,6 @@ mod bench {
         );
         let store_file = directory.open_read(path).unwrap();
         let store = StoreReader::open(store_file, 10).unwrap();
-        b.iter(|| store.iter(None).collect::<Vec<_>>());
+        b.iter(|| store.iter::<TantivyDocument>(None).collect::<Vec<_>>());
     }
 }

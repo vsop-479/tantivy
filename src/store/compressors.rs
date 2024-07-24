@@ -2,12 +2,6 @@ use std::io;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-pub trait StoreCompressor {
-    fn compress(&self, uncompressed: &[u8], compressed: &mut Vec<u8>) -> io::Result<()>;
-    fn decompress(&self, compressed: &[u8], decompressed: &mut Vec<u8>) -> io::Result<()>;
-    fn get_compressor_id() -> u8;
-}
-
 /// Compressor can be used on `IndexSettings` to choose
 /// the compressor used to compress the doc store.
 ///
@@ -17,12 +11,10 @@ pub enum Compressor {
     /// No compression
     None,
     /// Use the lz4 compressor (block format)
+    #[cfg(feature = "lz4-compression")]
     Lz4,
-    /// Use the brotli compressor
-    Brotli,
-    /// Use the snap compressor
-    Snappy,
     /// Use the zstd compressor
+    #[cfg(feature = "zstd-compression")]
     Zstd(ZstdCompressor),
 }
 
@@ -31,9 +23,9 @@ impl Serialize for Compressor {
     where S: serde::Serializer {
         match *self {
             Compressor::None => serializer.serialize_str("none"),
+            #[cfg(feature = "lz4-compression")]
             Compressor::Lz4 => serializer.serialize_str("lz4"),
-            Compressor::Brotli => serializer.serialize_str("brotli"),
-            Compressor::Snappy => serializer.serialize_str("snappy"),
+            #[cfg(feature = "zstd-compression")]
             Compressor::Zstd(zstd) => serializer.serialize_str(&zstd.ser_to_string()),
         }
     }
@@ -45,27 +37,38 @@ impl<'de> Deserialize<'de> for Compressor {
         let buf = String::deserialize(deserializer)?;
         let compressor = match buf.as_str() {
             "none" => Compressor::None,
+            #[cfg(feature = "lz4-compression")]
             "lz4" => Compressor::Lz4,
-            "brotli" => Compressor::Brotli,
-            "snappy" => Compressor::Snappy,
+            #[cfg(not(feature = "lz4-compression"))]
+            "lz4" => {
+                return Err(serde::de::Error::custom(
+                    "unsupported variant `lz4`, please enable Tantivy's `lz4-compression` feature",
+                ))
+            }
+            #[cfg(feature = "zstd-compression")]
+            _ if buf.starts_with("zstd") => Compressor::Zstd(
+                ZstdCompressor::deser_from_str(&buf).map_err(serde::de::Error::custom)?,
+            ),
+            #[cfg(not(feature = "zstd-compression"))]
+            _ if buf.starts_with("zstd") => {
+                return Err(serde::de::Error::custom(
+                    "unsupported variant `zstd`, please enable Tantivy's `zstd-compression` \
+                     feature",
+                ))
+            }
             _ => {
-                if buf.starts_with("zstd") {
-                    Compressor::Zstd(
-                        ZstdCompressor::deser_from_str(&buf).map_err(serde::de::Error::custom)?,
-                    )
-                } else {
-                    return Err(serde::de::Error::unknown_variant(
-                        &buf,
-                        &[
-                            "none",
-                            "lz4",
-                            "brotli",
-                            "snappy",
-                            "zstd",
-                            "zstd(compression_level=5)",
-                        ],
-                    ));
-                }
+                return Err(serde::de::Error::unknown_variant(
+                    &buf,
+                    &[
+                        "none",
+                        #[cfg(feature = "lz4-compression")]
+                        "lz4",
+                        #[cfg(feature = "zstd-compression")]
+                        "zstd",
+                        #[cfg(feature = "zstd-compression")]
+                        "zstd(compression_level=5)",
+                    ],
+                ));
             }
         };
 
@@ -80,10 +83,11 @@ pub struct ZstdCompressor {
     pub compression_level: Option<i32>,
 }
 
+#[cfg(feature = "zstd-compression")]
 impl ZstdCompressor {
     fn deser_from_str(val: &str) -> Result<ZstdCompressor, String> {
         if !val.starts_with("zstd") {
-            return Err(format!("needs to start with zstd, but got {}", val));
+            return Err(format!("needs to start with zstd, but got {val}"));
         }
         if val == "zstd" {
             return Ok(ZstdCompressor::default());
@@ -94,15 +98,12 @@ impl ZstdCompressor {
         for option in options.split(',') {
             let (opt_name, value) = options
                 .split_once('=')
-                .ok_or_else(|| format!("no '=' found in option {:?}", option))?;
+                .ok_or_else(|| format!("no '=' found in option {option:?}"))?;
 
             match opt_name {
                 "compression_level" => {
                     let value = value.parse::<i32>().map_err(|err| {
-                        format!(
-                            "Could not parse value {} of option {}, e: {}",
-                            value, opt_name, err
-                        )
+                        format!("Could not parse value {value} of option {opt_name}, e: {err}")
                     })?;
                     if value >= 15 {
                         warn!(
@@ -114,7 +115,7 @@ impl ZstdCompressor {
                     compressor.compression_level = Some(value);
                 }
                 _ => {
-                    return Err(format!("unknown zstd option {:?}", opt_name));
+                    return Err(format!("unknown zstd option {opt_name:?}"));
                 }
             }
         }
@@ -122,7 +123,7 @@ impl ZstdCompressor {
     }
     fn ser_to_string(&self) -> String {
         if let Some(compression_level) = self.compression_level {
-            format!("zstd(compression_level={})", compression_level)
+            format!("zstd(compression_level={compression_level})")
         } else {
             "zstd".to_string()
         }
@@ -130,18 +131,15 @@ impl ZstdCompressor {
 }
 
 impl Default for Compressor {
+    #[allow(unreachable_code)]
     fn default() -> Self {
-        if cfg!(feature = "lz4-compression") {
-            Compressor::Lz4
-        } else if cfg!(feature = "brotli-compression") {
-            Compressor::Brotli
-        } else if cfg!(feature = "snappy-compression") {
-            Compressor::Snappy
-        } else if cfg!(feature = "zstd-compression") {
-            Compressor::Zstd(ZstdCompressor::default())
-        } else {
-            Compressor::None
-        }
+        #[cfg(feature = "lz4-compression")]
+        return Compressor::Lz4;
+
+        #[cfg(feature = "zstd-compression")]
+        return Compressor::Zstd(ZstdCompressor::default());
+
+        Compressor::None
     }
 }
 
@@ -158,55 +156,19 @@ impl Compressor {
                 compressed.extend_from_slice(uncompressed);
                 Ok(())
             }
-            Self::Lz4 => {
-                #[cfg(feature = "lz4-compression")]
-                {
-                    super::compression_lz4_block::compress(uncompressed, compressed)
-                }
-                #[cfg(not(feature = "lz4-compression"))]
-                {
-                    panic!("lz4-compression feature flag not activated");
-                }
-            }
-            Self::Brotli => {
-                #[cfg(feature = "brotli-compression")]
-                {
-                    super::compression_brotli::compress(uncompressed, compressed)
-                }
-                #[cfg(not(feature = "brotli-compression"))]
-                {
-                    panic!("brotli-compression-compression feature flag not activated");
-                }
-            }
-            Self::Snappy => {
-                #[cfg(feature = "snappy-compression")]
-                {
-                    super::compression_snap::compress(uncompressed, compressed)
-                }
-                #[cfg(not(feature = "snappy-compression"))]
-                {
-                    panic!("snappy-compression feature flag not activated");
-                }
-            }
-            Self::Zstd(_zstd_compressor) => {
-                #[cfg(feature = "zstd-compression")]
-                {
-                    super::compression_zstd_block::compress(
-                        uncompressed,
-                        compressed,
-                        _zstd_compressor.compression_level,
-                    )
-                }
-                #[cfg(not(feature = "zstd-compression"))]
-                {
-                    panic!("zstd-compression feature flag not activated");
-                }
-            }
+            #[cfg(feature = "lz4-compression")]
+            Self::Lz4 => super::compression_lz4_block::compress(uncompressed, compressed),
+            #[cfg(feature = "zstd-compression")]
+            Self::Zstd(_zstd_compressor) => super::compression_zstd_block::compress(
+                uncompressed,
+                compressed,
+                _zstd_compressor.compression_level,
+            ),
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(feature = "zstd-compression", test))]
 mod tests {
     use super::*;
 

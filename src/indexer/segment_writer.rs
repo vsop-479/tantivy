@@ -1,21 +1,22 @@
 use columnar::MonotonicallyMappableToU64;
+use common::JsonPathWriter;
 use itertools::Itertools;
+use tokenizer_api::BoxTokenStream;
 
-use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
 use super::operation::AddOperation;
-use crate::core::json_utils::index_json_values;
-use crate::core::Segment;
 use crate::fastfield::FastFieldsWriter;
 use crate::fieldnorm::{FieldNormReaders, FieldNormsWriter};
+use crate::index::{Segment, SegmentComponent};
 use crate::indexer::segment_serializer::SegmentSerializer;
+use crate::json_utils::{index_json_value, IndexingPositionsPerPath};
 use crate::postings::{
-    compute_table_size, serialize_postings, IndexingContext, IndexingPosition,
+    compute_table_memory_size, serialize_postings, IndexingContext, IndexingPosition,
     PerFieldPostingsWriter, PostingsWriter,
 };
-use crate::schema::{FieldEntry, FieldType, Schema, Term, Value};
-use crate::store::{StoreReader, StoreWriter};
+use crate::schema::document::{Document, Value};
+use crate::schema::{FieldEntry, FieldType, Schema, Term, DATE_TIME_PRECISION_INDEXED};
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
-use crate::{DatePrecision, DocId, Document, Opstamp, SegmentComponent};
+use crate::{DocId, Opstamp, TantivyError};
 
 /// Computes the initial size of the hash table.
 ///
@@ -25,8 +26,10 @@ use crate::{DatePrecision, DocId, Document, Opstamp, SegmentComponent};
 fn compute_initial_table_size(per_thread_memory_budget: usize) -> crate::Result<usize> {
     let table_memory_upper_bound = per_thread_memory_budget / 3;
     (10..20) // We cap it at 2^19 = 512K capacity.
+        // TODO: There are cases where this limit causes a
+        // reallocation in the hashmap. Check if this affects performance.
         .map(|power| 1 << power)
-        .take_while(|capacity| compute_table_size(*capacity) < table_memory_upper_bound)
+        .take_while(|capacity| compute_table_memory_size(*capacity) < table_memory_upper_bound)
         .last()
         .ok_or_else(|| {
             crate::TantivyError::InvalidArgument(format!(
@@ -34,20 +37,6 @@ fn compute_initial_table_size(per_thread_memory_budget: usize) -> crate::Result<
                  memory budget or lower the number of threads."
             ))
         })
-}
-
-fn remap_doc_opstamps(
-    opstamps: Vec<Opstamp>,
-    doc_id_mapping_opt: Option<&DocIdMapping>,
-) -> Vec<Opstamp> {
-    if let Some(doc_id_mapping_opt) = doc_id_mapping_opt {
-        doc_id_mapping_opt
-            .iter_old_doc_ids()
-            .map(|doc| opstamps[doc as usize])
-            .collect()
-    } else {
-        opstamps
-    }
 }
 
 /// A `SegmentWriter` is in charge of creating segment index from a
@@ -62,6 +51,8 @@ pub struct SegmentWriter {
     pub(crate) segment_serializer: SegmentSerializer,
     pub(crate) fast_field_writers: FastFieldsWriter,
     pub(crate) fieldnorms_writer: FieldNormsWriter,
+    pub(crate) json_path_writer: JsonPathWriter,
+    pub(crate) json_positions_per_path: IndexingPositionsPerPath,
     pub(crate) doc_opstamps: Vec<Opstamp>,
     per_field_text_analyzers: Vec<TextAnalyzer>,
     term_buffer: Term,
@@ -78,14 +69,12 @@ impl SegmentWriter {
     /// the flushing behavior as a memory limit.
     /// - segment: The segment being written
     /// - schema
-    pub fn for_segment(
-        memory_budget_in_bytes: usize,
-        segment: Segment,
-    ) -> crate::Result<SegmentWriter> {
+    pub fn for_segment(memory_budget_in_bytes: usize, segment: Segment) -> crate::Result<Self> {
         let schema = segment.schema();
         let tokenizer_manager = segment.index().tokenizers().clone();
+        let tokenizer_manager_fast_field = segment.index().fast_field_tokenizer().clone();
         let table_size = compute_initial_table_size(memory_budget_in_bytes)?;
-        let segment_serializer = SegmentSerializer::for_segment(segment, false)?;
+        let segment_serializer = SegmentSerializer::for_segment(segment)?;
         let per_field_postings_writers = PerFieldPostingsWriter::for_schema(&schema);
         let per_field_text_analyzers = schema
             .fields()
@@ -97,21 +86,30 @@ impl SegmentWriter {
                     }
                     _ => None,
                 };
-                text_options
-                    .and_then(|text_index_option| {
-                        let tokenizer_name = &text_index_option.tokenizer();
-                        tokenizer_manager.get(tokenizer_name)
-                    })
-                    .unwrap_or_default()
+                let tokenizer_name = text_options
+                    .map(|text_index_option| text_index_option.tokenizer())
+                    .unwrap_or("default");
+
+                tokenizer_manager.get(tokenizer_name).ok_or_else(|| {
+                    TantivyError::SchemaError(format!(
+                        "Error getting tokenizer for field: {}",
+                        field_entry.name()
+                    ))
+                })
             })
-            .collect();
-        Ok(SegmentWriter {
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
             max_doc: 0,
             ctx: IndexingContext::new(table_size),
             per_field_postings_writers,
             fieldnorms_writer: FieldNormsWriter::for_schema(&schema),
+            json_path_writer: JsonPathWriter::default(),
+            json_positions_per_path: IndexingPositionsPerPath::default(),
             segment_serializer,
-            fast_field_writers: FastFieldsWriter::from_schema(&schema),
+            fast_field_writers: FastFieldsWriter::from_schema_and_tokenizer_manager(
+                &schema,
+                tokenizer_manager_fast_field,
+            )?,
             doc_opstamps: Vec::with_capacity(1_000),
             per_field_text_analyzers,
             term_buffer: Term::with_capacity(16),
@@ -125,27 +123,19 @@ impl SegmentWriter {
     /// be used afterwards.
     pub fn finalize(mut self) -> crate::Result<Vec<u64>> {
         self.fieldnorms_writer.fill_up_to_max_doc(self.max_doc);
-        let mapping: Option<DocIdMapping> = self
-            .segment_serializer
-            .segment()
-            .index()
-            .settings()
-            .sort_by_field
-            .clone()
-            .map(|sort_by_field| get_doc_id_mapping_from_field(sort_by_field, &self))
-            .transpose()?;
         remap_and_write(
+            self.schema,
             &self.per_field_postings_writers,
             self.ctx,
             self.fast_field_writers,
             &self.fieldnorms_writer,
             self.segment_serializer,
-            mapping.as_ref(),
         )?;
-        let doc_opstamps = remap_doc_opstamps(self.doc_opstamps, mapping.as_ref());
-        Ok(doc_opstamps)
+        Ok(self.doc_opstamps)
     }
 
+    /// Returns an estimation of the current memory usage of the segment writer.
+    /// If the mem usage exceeds the `memory_budget`, the segment be serialized.
     pub fn mem_usage(&self) -> usize {
         self.ctx.mem_usage()
             + self.fieldnorms_writer.mem_usage()
@@ -153,18 +143,21 @@ impl SegmentWriter {
             + self.segment_serializer.mem_usage()
     }
 
-    fn index_document(&mut self, doc: &Document) -> crate::Result<()> {
+    fn index_document<D: Document>(&mut self, doc: &D) -> crate::Result<()> {
         let doc_id = self.max_doc;
+
+        // TODO: Can this be optimised a bit?
         let vals_grouped_by_field = doc
-            .field_values()
-            .iter()
-            .sorted_by_key(|el| el.field())
-            .group_by(|el| el.field());
+            .iter_fields_and_values()
+            .sorted_by_key(|(field, _)| *field)
+            .group_by(|(field, _)| *field);
+
         for (field, field_values) in &vals_grouped_by_field {
-            let values = field_values.map(|field_value| field_value.value());
+            let values = field_values.map(|el| el.1);
+
             let field_entry = self.schema.get_field_entry(field);
             let make_schema_error = || {
-                crate::TantivyError::SchemaError(format!(
+                TantivyError::SchemaError(format!(
                     "Expected a {:?} for field {:?}",
                     field_entry.field_type().value_type(),
                     field_entry.name()
@@ -181,10 +174,12 @@ impl SegmentWriter {
 
             match field_entry.field_type() {
                 FieldType::Facet(_) => {
+                    let mut facet_tokenizer = FacetTokenizer::default(); // this can be global
                     for value in values {
-                        let facet = value.as_facet().ok_or_else(make_schema_error)?;
-                        let facet_str = facet.encoded_str();
-                        let mut facet_tokenizer = FacetTokenizer.token_stream(facet_str);
+                        let value = value.as_value();
+
+                        let facet_str = value.as_facet().ok_or_else(make_schema_error)?;
+                        let mut facet_tokenizer = facet_tokenizer.token_stream(facet_str);
                         let mut indexing_position = IndexingPosition::default();
                         postings_writer.index_text(
                             doc_id,
@@ -198,18 +193,16 @@ impl SegmentWriter {
                 FieldType::Str(_) => {
                     let mut indexing_position = IndexingPosition::default();
                     for value in values {
-                        let mut token_stream = match value {
-                            Value::PreTokStr(tok_str) => {
-                                PreTokenizedStream::from(tok_str.clone()).into()
-                            }
-                            Value::Str(ref text) => {
-                                let text_analyzer =
-                                    &self.per_field_text_analyzers[field.field_id() as usize];
-                                text_analyzer.token_stream(text)
-                            }
-                            _ => {
-                                continue;
-                            }
+                        let value = value.as_value();
+
+                        let mut token_stream = if let Some(text) = value.as_str() {
+                            let text_analyzer =
+                                &mut self.per_field_text_analyzers[field.field_id() as usize];
+                            text_analyzer.token_stream(text)
+                        } else if let Some(tok_str) = value.into_pre_tokenized_text() {
+                            BoxTokenStream::new(PreTokenizedStream::from(*tok_str.clone()))
+                        } else {
+                            continue;
                         };
 
                         assert!(term_buffer.is_empty());
@@ -229,6 +222,8 @@ impl SegmentWriter {
                 FieldType::U64(_) => {
                     let mut num_vals = 0;
                     for value in values {
+                        let value = value.as_value();
+
                         num_vals += 1;
                         let u64_val = value.as_u64().ok_or_else(make_schema_error)?;
                         term_buffer.set_u64(u64_val);
@@ -241,9 +236,12 @@ impl SegmentWriter {
                 FieldType::Date(_) => {
                     let mut num_vals = 0;
                     for value in values {
+                        let value = value.as_value();
+
                         num_vals += 1;
-                        let date_val = value.as_date().ok_or_else(make_schema_error)?;
-                        term_buffer.set_u64(date_val.truncate(DatePrecision::Seconds).to_u64());
+                        let date_val = value.as_datetime().ok_or_else(make_schema_error)?;
+                        term_buffer
+                            .set_u64(date_val.truncate(DATE_TIME_PRECISION_INDEXED).to_u64());
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                     if field_entry.has_fieldnorms() {
@@ -253,6 +251,8 @@ impl SegmentWriter {
                 FieldType::I64(_) => {
                     let mut num_vals = 0;
                     for value in values {
+                        let value = value.as_value();
+
                         num_vals += 1;
                         let i64_val = value.as_i64().ok_or_else(make_schema_error)?;
                         term_buffer.set_i64(i64_val);
@@ -265,6 +265,7 @@ impl SegmentWriter {
                 FieldType::F64(_) => {
                     let mut num_vals = 0;
                     for value in values {
+                        let value = value.as_value();
                         num_vals += 1;
                         let f64_val = value.as_f64().ok_or_else(make_schema_error)?;
                         term_buffer.set_f64(f64_val);
@@ -277,6 +278,7 @@ impl SegmentWriter {
                 FieldType::Bool(_) => {
                     let mut num_vals = 0;
                     for value in values {
+                        let value = value.as_value();
                         num_vals += 1;
                         let bool_val = value.as_bool().ok_or_else(make_schema_error)?;
                         term_buffer.set_bool(bool_val);
@@ -289,6 +291,7 @@ impl SegmentWriter {
                 FieldType::Bytes(_) => {
                     let mut num_vals = 0;
                     for value in values {
+                        let value = value.as_value();
                         num_vals += 1;
                         let bytes = value.as_bytes().ok_or_else(make_schema_error)?;
                         term_buffer.set_bytes(bytes);
@@ -299,22 +302,32 @@ impl SegmentWriter {
                     }
                 }
                 FieldType::JsonObject(json_options) => {
-                    let text_analyzer = &self.per_field_text_analyzers[field.field_id() as usize];
-                    let json_values_it =
-                        values.map(|value| value.as_json().ok_or_else(make_schema_error));
-                    index_json_values(
-                        doc_id,
-                        json_values_it,
-                        text_analyzer,
-                        json_options.is_expand_dots_enabled(),
-                        term_buffer,
-                        postings_writer,
-                        ctx,
-                    )?;
+                    let text_analyzer =
+                        &mut self.per_field_text_analyzers[field.field_id() as usize];
+
+                    self.json_positions_per_path.clear();
+                    self.json_path_writer
+                        .set_expand_dots(json_options.is_expand_dots_enabled());
+                    for json_value in values {
+                        self.json_path_writer.clear();
+
+                        index_json_value(
+                            doc_id,
+                            json_value,
+                            text_analyzer,
+                            term_buffer,
+                            &mut self.json_path_writer,
+                            postings_writer,
+                            ctx,
+                            &mut self.json_positions_per_path,
+                        );
+                    }
                 }
                 FieldType::IpAddr(_) => {
                     let mut num_vals = 0;
                     for value in values {
+                        let value = value.as_value();
+
                         num_vals += 1;
                         let ip_addr = value.as_ip_addr().ok_or_else(make_schema_error)?;
                         term_buffer.set_ip_addr(ip_addr);
@@ -332,7 +345,10 @@ impl SegmentWriter {
     /// Indexes a new document
     ///
     /// As a user, you should rather use `IndexWriter`'s add_document.
-    pub fn add_document(&mut self, add_operation: AddOperation) -> crate::Result<()> {
+    pub fn add_document<D: Document>(
+        &mut self,
+        add_operation: AddOperation<D>,
+    ) -> crate::Result<()> {
         let AddOperation { document, opstamp } = add_operation;
         self.doc_opstamps.push(opstamp);
         self.fast_field_writers.add_document(&document)?;
@@ -370,16 +386,16 @@ impl SegmentWriter {
 ///
 /// `doc_id_map` is used to map to the new doc_id order.
 fn remap_and_write(
+    schema: Schema,
     per_field_postings_writers: &PerFieldPostingsWriter,
     ctx: IndexingContext,
     fast_field_writers: FastFieldsWriter,
     fieldnorms_writer: &FieldNormsWriter,
     mut serializer: SegmentSerializer,
-    doc_id_map: Option<&DocIdMapping>,
 ) -> crate::Result<()> {
     debug!("remap-and-write");
     if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
-        fieldnorms_writer.serialize(fieldnorms_serializer, doc_id_map)?;
+        fieldnorms_writer.serialize(fieldnorms_serializer)?;
     }
     let fieldnorm_data = serializer
         .segment()
@@ -387,41 +403,13 @@ fn remap_and_write(
     let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
     serialize_postings(
         ctx,
+        schema,
         per_field_postings_writers,
         fieldnorm_readers,
-        doc_id_map,
         serializer.get_postings_serializer(),
     )?;
     debug!("fastfield-serialize");
-    fast_field_writers.serialize(serializer.get_fast_field_write(), doc_id_map)?;
-
-    // finalize temp docstore and create version, which reflects the doc_id_map
-    if let Some(doc_id_map) = doc_id_map {
-        debug!("resort-docstore");
-        let store_write = serializer
-            .segment_mut()
-            .open_write(SegmentComponent::Store)?;
-        let settings = serializer.segment().index().settings();
-        let store_writer = StoreWriter::new(
-            store_write,
-            settings.docstore_compression,
-            settings.docstore_blocksize,
-            settings.docstore_compress_dedicated_thread,
-        )?;
-        let old_store_writer = std::mem::replace(&mut serializer.store_writer, store_writer);
-        old_store_writer.close()?;
-        let store_read = StoreReader::open(
-            serializer
-                .segment()
-                .open_read(SegmentComponent::TempStore)?,
-            1, /* The docstore is configured to have one doc per block, and each doc is accessed
-                * only once: we don't need caching. */
-        )?;
-        for old_doc_id in doc_id_map.iter_old_doc_ids() {
-            let doc_bytes = store_read.get_document_bytes(old_doc_id)?;
-            serializer.get_store_writer().store_bytes(&doc_bytes)?;
-        }
-    }
+    fast_field_writers.serialize(serializer.get_fast_field_write())?;
 
     debug!("serializer-close");
     serializer.close()?;
@@ -431,28 +419,36 @@ fn remap_and_write(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
 
-    use super::compute_initial_table_size;
-    use crate::collector::Count;
-    use crate::core::json_utils::JsonTermWriter;
+    use tempfile::TempDir;
+
+    use crate::collector::{Count, TopDocs};
     use crate::directory::RamDirectory;
-    use crate::postings::TermInfo;
-    use crate::query::PhraseQuery;
-    use crate::schema::{IndexRecordOption, Schema, Type, STORED, STRING, TEXT};
+    use crate::fastfield::FastValue;
+    use crate::postings::{Postings, TermInfo};
+    use crate::query::{PhraseQuery, QueryParser};
+    use crate::schema::{
+        Document, IndexRecordOption, OwnedValue, Schema, TextFieldIndexing, TextOptions, Value,
+        STORED, STRING, TEXT,
+    };
     use crate::store::{Compressor, StoreReader, StoreWriter};
     use crate::time::format_description::well_known::Rfc3339;
     use crate::time::OffsetDateTime;
     use crate::tokenizer::{PreTokenizedString, Token};
     use crate::{
-        DateTime, Directory, DocAddress, DocSet, Document, Index, Postings, Term, TERMINATED,
+        DateTime, Directory, DocAddress, DocSet, Index, IndexWriter, TantivyDocument, Term,
+        TERMINATED,
     };
 
     #[test]
+    #[cfg(not(feature = "compare_hash_only"))]
     fn test_hashmap_size() {
-        assert_eq!(compute_initial_table_size(100_000).unwrap(), 1 << 11);
-        assert_eq!(compute_initial_table_size(1_000_000).unwrap(), 1 << 14);
-        assert_eq!(compute_initial_table_size(10_000_000).unwrap(), 1 << 17);
+        use super::compute_initial_table_size;
+        assert_eq!(compute_initial_table_size(100_000).unwrap(), 1 << 12);
+        assert_eq!(compute_initial_table_size(1_000_000).unwrap(), 1 << 15);
+        assert_eq!(compute_initial_table_size(15_000_000).unwrap(), 1 << 19);
         assert_eq!(compute_initial_table_size(1_000_000_000).unwrap(), 1 << 19);
         assert_eq!(compute_initial_table_size(4_000_000_000).unwrap(), 1 << 19);
     }
@@ -462,7 +458,7 @@ mod tests {
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("title", TEXT | STORED);
         let schema = schema_builder.build();
-        let mut doc = Document::default();
+        let mut doc = TantivyDocument::default();
         let pre_tokenized_text = PreTokenizedString {
             text: String::from("A"),
             tokens: vec![Token {
@@ -486,11 +482,93 @@ mod tests {
         store_writer.close().unwrap();
 
         let reader = StoreReader::open(directory.open_read(path).unwrap(), 0).unwrap();
-        let doc = reader.get(0).unwrap();
+        let doc = reader.get::<TantivyDocument>(0).unwrap();
 
-        assert_eq!(doc.field_values().len(), 2);
-        assert_eq!(doc.field_values()[0].value().as_text(), Some("A"));
-        assert_eq!(doc.field_values()[1].value().as_text(), Some("title"));
+        assert_eq!(doc.field_values().count(), 2);
+        assert_eq!(
+            doc.get_all(text_field).next().unwrap().as_value().as_str(),
+            Some("A")
+        );
+        assert_eq!(
+            doc.get_all(text_field).nth(1).unwrap().as_value().as_str(),
+            Some("title")
+        );
+    }
+    #[test]
+    fn test_simple_json_indexing() {
+        let mut schema_builder = Schema::builder();
+        let json_field = schema_builder.add_json_field("json", STORED | STRING);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema.clone());
+        let mut writer = index.writer_for_tests().unwrap();
+        writer
+            .add_document(doc!(json_field=>json!({"my_field": "b"})))
+            .unwrap();
+        writer
+            .add_document(doc!(json_field=>json!({"my_field": "a"})))
+            .unwrap();
+        writer
+            .add_document(doc!(json_field=>json!({"my_field": "b"})))
+            .unwrap();
+        writer.commit().unwrap();
+
+        let query_parser = QueryParser::for_index(&index, vec![json_field]);
+        let text_query = query_parser.parse_query("my_field:a").unwrap();
+        let score_docs: Vec<(_, DocAddress)> = index
+            .reader()
+            .unwrap()
+            .searcher()
+            .search(&text_query, &TopDocs::with_limit(4))
+            .unwrap();
+        assert_eq!(score_docs.len(), 1);
+
+        let text_query = query_parser.parse_query("my_field:b").unwrap();
+        let score_docs: Vec<(_, DocAddress)> = index
+            .reader()
+            .unwrap()
+            .searcher()
+            .search(&text_query, &TopDocs::with_limit(4))
+            .unwrap();
+        assert_eq!(score_docs.len(), 2);
+    }
+
+    #[test]
+    fn test_flat_json_indexing() {
+        // A JSON Object that contains mixed values on the first level
+        let mut schema_builder = Schema::builder();
+        let json_field = schema_builder.add_json_field("json", STORED | STRING);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema.clone());
+        let mut writer = index.writer_for_tests().unwrap();
+        // Text, i64, u64
+        writer.add_document(doc!(json_field=>"b")).unwrap();
+        writer
+            .add_document(doc!(json_field=>OwnedValue::I64(10i64)))
+            .unwrap();
+        writer
+            .add_document(doc!(json_field=>OwnedValue::U64(55u64)))
+            .unwrap();
+        writer
+            .add_document(doc!(json_field=>json!({"my_field": "a"})))
+            .unwrap();
+        writer.commit().unwrap();
+
+        let search_and_expect = |query| {
+            let query_parser = QueryParser::for_index(&index, vec![json_field]);
+            let text_query = query_parser.parse_query(query).unwrap();
+            let score_docs: Vec<(_, DocAddress)> = index
+                .reader()
+                .unwrap()
+                .searcher()
+                .search(&text_query, &TopDocs::with_limit(4))
+                .unwrap();
+            assert_eq!(score_docs.len(), 1);
+        };
+
+        search_and_expect("my_field:a");
+        search_and_expect("b");
+        search_and_expect("10");
+        search_and_expect("55");
     }
 
     #[test]
@@ -498,7 +576,7 @@ mod tests {
         let mut schema_builder = Schema::builder();
         let json_field = schema_builder.add_json_field("json", STORED | TEXT);
         let schema = schema_builder.build();
-        let json_val: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+        let json_val: serde_json::Value = serde_json::from_str(
             r#"{
             "toto": "titi",
             "float": -0.2,
@@ -521,98 +599,130 @@ mod tests {
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
         let doc = searcher
-            .doc(DocAddress {
+            .doc::<TantivyDocument>(DocAddress {
                 segment_ord: 0u32,
                 doc_id: 0u32,
             })
             .unwrap();
-        let serdeser_json_val = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
-            &schema.to_json(&doc),
-        )
-        .unwrap()
-        .get("json")
-        .unwrap()[0]
-            .as_object()
+        let serdeser_json_val = serde_json::from_str::<serde_json::Value>(&doc.to_json(&schema))
             .unwrap()
+            .get("json")
+            .unwrap()[0]
             .clone();
         assert_eq!(json_val, serdeser_json_val);
         let segment_reader = searcher.segment_reader(0u32);
         let inv_idx = segment_reader.inverted_index(json_field).unwrap();
         let term_dict = inv_idx.terms();
 
-        let mut term = Term::with_type_and_field(Type::Json, json_field);
         let mut term_stream = term_dict.stream().unwrap();
 
-        let mut json_term_writer = JsonTermWriter::wrap(&mut term, false);
+        let term_from_path =
+            |path: &str| -> Term { Term::from_field_json_path(json_field, path, false) };
 
-        json_term_writer.push_path_segment("bool");
-        json_term_writer.set_fast_value(true);
-        assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        fn set_fast_val<T: FastValue>(val: T, mut term: Term) -> Term {
+            term.append_type_and_fast_value(val);
+            term
+        }
+        fn set_str(val: &str, mut term: Term) -> Term {
+            term.append_type_and_str(val);
+            term
+        }
 
-        json_term_writer.pop_path_segment();
-        json_term_writer.push_path_segment("complexobject");
-        json_term_writer.push_path_segment("field.with.dot");
-        json_term_writer.set_fast_value(1u64);
+        let term = term_from_path("bool");
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            set_fast_val(true, term).serialized_value_bytes()
+        );
 
-        json_term_writer.pop_path_segment();
-        json_term_writer.pop_path_segment();
-        json_term_writer.push_path_segment("date");
-        json_term_writer.set_fast_value(DateTime::from_utc(
-            OffsetDateTime::parse("1985-04-12T23:20:50.52Z", &Rfc3339).unwrap(),
-        ));
+        let term = term_from_path("complexobject.field\\.with\\.dot");
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            set_fast_val(1i64, term).serialized_value_bytes()
+        );
 
-        json_term_writer.pop_path_segment();
-        json_term_writer.push_path_segment("float");
-        json_term_writer.set_fast_value(-0.2f64);
-        assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        // Date
+        let term = term_from_path("date");
 
-        json_term_writer.pop_path_segment();
-        json_term_writer.push_path_segment("my_arr");
-        json_term_writer.set_fast_value(2u64);
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            set_fast_val(
+                DateTime::from_utc(
+                    OffsetDateTime::parse("1985-04-12T23:20:50.52Z", &Rfc3339).unwrap(),
+                ),
+                term
+            )
+            .serialized_value_bytes()
+        );
 
-        json_term_writer.set_fast_value(3u64);
+        // Float
+        let term = term_from_path("float");
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            set_fast_val(-0.2f64, term).serialized_value_bytes()
+        );
 
-        json_term_writer.set_fast_value(4u64);
+        // Number In Array
+        let term = term_from_path("my_arr");
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            set_fast_val(2i64, term).serialized_value_bytes()
+        );
 
-        json_term_writer.push_path_segment("my_key");
-        json_term_writer.set_str("tokens");
+        let term = term_from_path("my_arr");
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            set_fast_val(3i64, term).serialized_value_bytes()
+        );
 
-        json_term_writer.set_str("two");
+        let term = term_from_path("my_arr");
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            set_fast_val(4i64, term).serialized_value_bytes()
+        );
 
-        json_term_writer.pop_path_segment();
-        json_term_writer.pop_path_segment();
-        json_term_writer.push_path_segment("signed");
-        json_term_writer.set_fast_value(-2i64);
+        // El in Array
+        let term = term_from_path("my_arr.my_key");
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            set_str("tokens", term).serialized_value_bytes()
+        );
+        let term = term_from_path("my_arr.my_key");
+        assert!(term_stream.advance());
+        assert_eq!(
+            term_stream.key(),
+            set_str("two", term).serialized_value_bytes()
+        );
 
-        json_term_writer.pop_path_segment();
-        json_term_writer.push_path_segment("toto");
-        json_term_writer.set_str("titi");
+        // Signed
+        let term = term_from_path("signed");
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            set_fast_val(-2i64, term).serialized_value_bytes()
+        );
 
-        json_term_writer.pop_path_segment();
-        json_term_writer.push_path_segment("unsigned");
-        json_term_writer.set_fast_value(1u64);
+        let term = term_from_path("toto");
         assert!(term_stream.advance());
-        assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
+        assert_eq!(
+            term_stream.key(),
+            set_str("titi", term).serialized_value_bytes()
+        );
+        // Unsigned
+        let term = term_from_path("unsigned");
+        assert!(term_stream.advance());
+        assert_eq!(
+            term_stream.key(),
+            set_fast_val(1i64, term).serialized_value_bytes()
+        );
+
         assert!(!term_stream.advance());
     }
 
@@ -621,10 +731,10 @@ mod tests {
         let mut schema_builder = Schema::builder();
         let json_field = schema_builder.add_json_field("json", STORED | TEXT);
         let schema = schema_builder.build();
-        let mut doc = Document::default();
-        let json_val: serde_json::Map<String, serde_json::Value> =
+        let mut doc = TantivyDocument::default();
+        let json_val: BTreeMap<String, crate::schema::OwnedValue> =
             serde_json::from_str(r#"{"mykey": "repeated token token"}"#).unwrap();
-        doc.add_json_object(json_field, json_val);
+        doc.add_object(json_field, json_val);
         let index = Index::create_in_ram(schema);
         let mut writer = index.writer_for_tests().unwrap();
         writer.add_document(doc).unwrap();
@@ -633,14 +743,9 @@ mod tests {
         let searcher = reader.searcher();
         let segment_reader = searcher.segment_reader(0u32);
         let inv_index = segment_reader.inverted_index(json_field).unwrap();
-        let mut term = Term::with_type_and_field(Type::Json, json_field);
-        let mut json_term_writer = JsonTermWriter::wrap(&mut term, false);
-        json_term_writer.push_path_segment("mykey");
-        json_term_writer.set_str("token");
-        let term_info = inv_index
-            .get_term_info(json_term_writer.term())
-            .unwrap()
-            .unwrap();
+        let mut term = Term::from_field_json_path(json_field, "mykey", false);
+        term.append_type_and_str("token");
+        let term_info = inv_index.get_term_info(&term).unwrap().unwrap();
         assert_eq!(
             term_info,
             TermInfo {
@@ -666,7 +771,7 @@ mod tests {
         let mut schema_builder = Schema::builder();
         let json_field = schema_builder.add_json_field("json", STRING);
         let schema = schema_builder.build();
-        let json_val: serde_json::Map<String, serde_json::Value> =
+        let json_val: serde_json::Value =
             serde_json::from_str(r#"{"mykey": "two tokens"}"#).unwrap();
         let doc = doc!(json_field=>json_val);
         let index = Index::create_in_ram(schema);
@@ -677,14 +782,9 @@ mod tests {
         let searcher = reader.searcher();
         let segment_reader = searcher.segment_reader(0u32);
         let inv_index = segment_reader.inverted_index(json_field).unwrap();
-        let mut term = Term::with_type_and_field(Type::Json, json_field);
-        let mut json_term_writer = JsonTermWriter::wrap(&mut term, false);
-        json_term_writer.push_path_segment("mykey");
-        json_term_writer.set_str("two tokens");
-        let term_info = inv_index
-            .get_term_info(json_term_writer.term())
-            .unwrap()
-            .unwrap();
+        let mut term = Term::from_field_json_path(json_field, "mykey", false);
+        term.append_type_and_str("two tokens");
+        let term_info = inv_index.get_term_info(&term).unwrap().unwrap();
         assert_eq!(
             term_info,
             TermInfo {
@@ -711,7 +811,7 @@ mod tests {
         let mut schema_builder = Schema::builder();
         let json_field = schema_builder.add_json_field("json", TEXT);
         let schema = schema_builder.build();
-        let json_val: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+        let json_val: serde_json::Value = serde_json::from_str(
             r#"{"mykey": [{"field": "hello happy tax payer"}, {"field": "nothello"}]}"#,
         )
         .unwrap();
@@ -722,20 +822,47 @@ mod tests {
         writer.commit().unwrap();
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
-        let mut term = Term::with_type_and_field(Type::Json, json_field);
-        let mut json_term_writer = JsonTermWriter::wrap(&mut term, false);
-        json_term_writer.push_path_segment("mykey");
-        json_term_writer.push_path_segment("field");
-        json_term_writer.set_str("hello");
-        let hello_term = json_term_writer.term().clone();
-        json_term_writer.set_str("nothello");
-        let nothello_term = json_term_writer.term().clone();
-        json_term_writer.set_str("happy");
-        let happy_term = json_term_writer.term().clone();
+
+        let term = Term::from_field_json_path(json_field, "mykey.field", false);
+
+        let mut hello_term = term.clone();
+        hello_term.append_type_and_str("hello");
+
+        let mut nothello_term = term.clone();
+        nothello_term.append_type_and_str("nothello");
+
+        let mut happy_term = term.clone();
+        happy_term.append_type_and_str("happy");
+
         let phrase_query = PhraseQuery::new(vec![hello_term, happy_term.clone()]);
         assert_eq!(searcher.search(&phrase_query, &Count).unwrap(), 1);
         let phrase_query = PhraseQuery::new(vec![nothello_term, happy_term]);
         assert_eq!(searcher.search(&phrase_query, &Count).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_json_term_with_numeric_merge_panic_regression_bug_2283() {
+        // https://github.com/quickwit-oss/tantivy/issues/2283
+        let mut schema_builder = Schema::builder();
+        let json = schema_builder.add_json_field("json", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut writer = index.writer_for_tests().unwrap();
+        let doc = json!({"field": "a"});
+        writer.add_document(doc!(json=>doc)).unwrap();
+        writer.commit().unwrap();
+        let doc = json!({"field": "a", "id": 1});
+        writer.add_document(doc!(json=>doc.clone())).unwrap();
+        writer.commit().unwrap();
+
+        // Force Merge
+        writer.wait_merging_threads().unwrap();
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+        let segment_ids = index
+            .searchable_segment_ids()
+            .expect("Searchable segments failed.");
+        index_writer.merge(&segment_ids).wait().unwrap();
+        assert!(index_writer.wait_merging_threads().is_ok());
     }
 
     #[test]
@@ -748,11 +875,10 @@ mod tests {
         let mut schema_builder = Schema::builder();
         let text = schema_builder.add_text_field("text", TEXT);
         let schema = schema_builder.build();
-        let doc = schema
-            .parse_document(r#"{"text": [ "bbb", "aaa", "", "aaa"]}"#)
+        let doc = TantivyDocument::parse_json(&schema, r#"{"text": [ "bbb", "aaa", "", "aaa"]}"#)
             .unwrap();
         let index = Index::create_in_ram(schema);
-        let mut index_writer = index.writer_for_tests().unwrap();
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
         index_writer.add_document(doc).unwrap();
         // On debug this did panic on the underflow
         index_writer.commit().unwrap();
@@ -777,7 +903,7 @@ mod tests {
         let mut schema_builder = Schema::builder();
         let text = schema_builder.add_text_field("text", TEXT);
         let schema = schema_builder.build();
-        let mut doc = Document::default();
+        let mut doc = TantivyDocument::default();
         // This is a bit of a contrived example.
         let tokens = PreTokenizedString {
             text: "roller-coaster".to_string(),
@@ -792,7 +918,7 @@ mod tests {
         doc.add_pre_tokenized_text(text, tokens.clone());
         doc.add_pre_tokenized_text(text, tokens);
         let index = Index::create_in_ram(schema);
-        let mut index_writer = index.writer_for_tests().unwrap();
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
         index_writer.add_document(doc).unwrap();
         index_writer.commit().unwrap();
         let reader = index.reader().unwrap();
@@ -815,7 +941,7 @@ mod tests {
         let mut schema_builder = Schema::builder();
         let text = schema_builder.add_text_field("text", TEXT);
         let schema = schema_builder.build();
-        let mut doc = Document::default();
+        let mut doc = TantivyDocument::default();
         // This is a bit of a contrived example.
         let tokens = PreTokenizedString {
             text: "contrived-example".to_string(), //< I can't think of a use case where this corner case happens in real life.
@@ -840,7 +966,7 @@ mod tests {
         doc.add_pre_tokenized_text(text, tokens);
         doc.add_text(text, "hello");
         let index = Index::create_in_ram(schema);
-        let mut index_writer = index.writer_for_tests().unwrap();
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
         index_writer.add_document(doc).unwrap();
         index_writer.commit().unwrap();
         let reader = index.reader().unwrap();
@@ -856,5 +982,33 @@ mod tests {
         let mut positions = Vec::new();
         postings.positions(&mut positions);
         assert_eq!(positions, &[4]); //< as opposed to 3 if we had a position length of 1.
+    }
+
+    #[test]
+    fn test_show_error_when_tokenizer_not_registered() {
+        let text_field_indexing = TextFieldIndexing::default()
+            .set_tokenizer("custom_en")
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+        let text_options = TextOptions::default()
+            .set_indexing_options(text_field_indexing)
+            .set_stored();
+        let mut schema_builder = Schema::builder();
+        schema_builder.add_text_field("title", text_options);
+        let schema = schema_builder.build();
+        let tempdir = TempDir::new().unwrap();
+        let tempdir_path = PathBuf::from(tempdir.path());
+        Index::create_in_dir(&tempdir_path, schema).unwrap();
+        let index = Index::open_in_dir(tempdir_path).unwrap();
+        let schema = index.schema();
+        let mut index_writer = index.writer(50_000_000).unwrap();
+        let title = schema.get_field("title").unwrap();
+        let mut document = TantivyDocument::default();
+        document.add_text(title, "The Old Man and the Sea");
+        index_writer.add_document(document).unwrap();
+        let error = index_writer.commit().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Schema error: 'Error getting tokenizer for field: title'"
+        );
     }
 }

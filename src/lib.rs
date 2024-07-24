@@ -21,7 +21,7 @@
 //! # use tantivy::collector::TopDocs;
 //! # use tantivy::query::QueryParser;
 //! # use tantivy::schema::*;
-//! # use tantivy::{doc, DocAddress, Index, Score};
+//! # use tantivy::{doc, DocAddress, Index, IndexWriter, Score};
 //! #
 //! # fn main() {
 //! #     // Let's create a temporary directory for the
@@ -53,7 +53,7 @@
 //!
 //! // Here we use a buffer of 100MB that will be split
 //! // between indexing threads.
-//! let mut index_writer = index.writer(100_000_000)?;
+//! let mut index_writer: IndexWriter = index.writer(100_000_000)?;
 //!
 //! // Let's index one documents!
 //! index_writer.add_document(doc!(
@@ -89,8 +89,8 @@
 //!
 //! for (_score, doc_address) in top_docs {
 //!     // Retrieve the actual content of documents given its `doc_address`.
-//!     let retrieved_doc = searcher.doc(doc_address)?;
-//!     println!("{}", schema.to_json(&retrieved_doc));
+//!     let retrieved_doc = searcher.doc::<TantivyDocument>(doc_address)?;
+//!     println!("{}", retrieved_doc.to_json(&schema));
 //! }
 //!
 //! # Ok(())
@@ -103,7 +103,48 @@
 //! the example code (
 //! [literate programming](https://tantivy-search.github.io/examples/basic_search.html) /
 //! [source code](https://github.com/quickwit-oss/tantivy/blob/main/examples/basic_search.rs))
-
+//!
+//! # Tantivy Architecture Overview
+//!
+//! Tantivy is inspired by Lucene, the Architecture is very similar.
+//!
+//! ## Core Concepts
+//!
+//! - **[Index]**: A collection of segments. The top level entry point for tantivy users to search
+//!   and index data.
+//!
+//! - **[Segment]**: At the heart of Tantivy's indexing structure is the [Segment]. It contains
+//!   documents and indices and is the atomic unit of indexing and search.
+//!
+//! - **[Schema](schema)**: A schema is a set of fields in an index. Each field has a specific data
+//!   type and set of attributes.
+//!
+//! - **[IndexWriter]**: Responsible creating and merging segments. It executes the indexing
+//!   pipeline including tokenization, creating indices, and storing the index in the
+//!   [Directory](directory).
+//!
+//! - **Searching**: [Searcher] searches the segments with anything that implements
+//!   [Query](query::Query) and merges the results. The list of [supported
+//! queries](query::Query#implementors). Custom Queries are supported by implementing the
+//! [Query](query::Query) trait.
+//!
+//! - **[Directory](directory)**: Abstraction over the storage where the index data is stored.
+//!
+//! - **[Tokenizer](tokenizer)**: Breaks down text into individual tokens. Users can implement or
+//!   use provided tokenizers.
+//!
+//! ## Architecture Flow
+//!
+//! 1. **Document Addition**: Users create documents according to the defined schema. The documents
+//!    fields are tokenized, processed, and added to the current segment. See
+//!    [Document](schema::document) for the structure and usage.
+//!
+//! 2. **Segment Creation**: Once the memory limit threshold is reached or a commit is called, the
+//!    segment is written to the Directory. Documents are searchable after `commit`.
+//!
+//! 3. **Merging**: To optimize space and search speed, segments might be merged. This operation is
+//!    performed in the background. Customize the merge behaviour via
+//!    [IndexWriter::set_merge_policy].
 #[cfg_attr(test, macro_use)]
 extern crate serde_json;
 #[macro_use]
@@ -137,7 +178,8 @@ pub use crate::future_result::FutureResult;
 pub type Result<T> = std::result::Result<T, TantivyError>;
 
 mod core;
-mod indexer;
+#[allow(deprecated)] // Remove with index sorting
+pub mod indexer;
 
 #[allow(unused_doc_comments)]
 pub mod error;
@@ -148,6 +190,8 @@ pub mod collector;
 pub mod directory;
 pub mod fastfield;
 pub mod fieldnorm;
+#[allow(deprecated)] // Remove with index sorting
+pub mod index;
 pub mod positions;
 pub mod postings;
 
@@ -161,8 +205,7 @@ pub mod termdict;
 mod reader;
 
 pub use self::reader::{IndexReader, IndexReaderBuilder, ReloadPolicy, Warmer};
-mod snippet;
-pub use self::snippet::{Snippet, SnippetGenerator};
+pub mod snippet;
 
 mod docset;
 use std::fmt;
@@ -172,20 +215,23 @@ pub use common::{f64_to_u64, i64_to_u64, u64_to_f64, u64_to_i64, HasLen};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
-pub use self::docset::{DocSet, TERMINATED};
-pub use crate::core::{
-    Executor, Index, IndexBuilder, IndexMeta, IndexSettings, IndexSortByField, InvertedIndexReader,
-    Order, Searcher, SearcherGeneration, Segment, SegmentComponent, SegmentId, SegmentMeta,
-    SegmentReader, SingleSegmentIndexWriter,
-};
+pub use self::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
+#[doc(hidden)]
+pub use crate::core::json_utils;
+pub use crate::core::{Executor, Searcher, SearcherGeneration};
 pub use crate::directory::Directory;
-pub use crate::indexer::operation::UserOperation;
-pub use crate::indexer::{merge_filtered_segments, merge_indices, IndexWriter, PreparedCommit};
-pub use crate::postings::Postings;
-pub use crate::schema::{DateOptions, DatePrecision, Document, Term};
+#[allow(deprecated)] // Remove with index sorting
+pub use crate::index::{
+    Index, IndexBuilder, IndexMeta, IndexSettings, InvertedIndexReader, Order, Segment,
+    SegmentMeta, SegmentReader,
+};
+pub use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
+pub use crate::schema::{Document, TantivyDocument, Term};
 
 /// Index format version.
-const INDEX_FORMAT_VERSION: u32 = 5;
+const INDEX_FORMAT_VERSION: u32 = 6;
+/// Oldest index format version this tantivy version can read.
+const INDEX_FORMAT_OLDEST_SUPPORTED_VERSION: u32 = 4;
 
 /// Structure version for the index.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,7 +244,7 @@ pub struct Version {
 
 impl fmt::Debug for Version {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.to_string())
+        fmt::Display::fmt(self, f)
     }
 }
 
@@ -209,9 +255,10 @@ static VERSION: Lazy<Version> = Lazy::new(|| Version {
     index_format_version: INDEX_FORMAT_VERSION,
 });
 
-impl ToString for Version {
-    fn to_string(&self) -> String {
-        format!(
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
             "tantivy v{}.{}.{}, index_format v{}",
             self.major, self.minor, self.patch, self.index_format_version
         )
@@ -283,7 +330,7 @@ impl DocAddress {
 ///
 /// The id used for the segment is actually an ordinal
 /// in the list of `Segment`s held by a `Searcher`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DocAddress {
     /// The segment ordinal id that identifies the segment
     /// hosting the document in the `Searcher` it is called from.
@@ -292,21 +339,52 @@ pub struct DocAddress {
     pub doc_id: DocId,
 }
 
+#[macro_export]
+/// Enable fail_point if feature is enabled.
+macro_rules! fail_point {
+    ($name:expr) => {{
+        #[cfg(feature = "failpoints")]
+        {
+            fail::eval($name, |_| {
+                panic!("Return is not supported for the fail point \"{}\"", $name);
+            });
+        }
+    }};
+    ($name:expr, $e:expr) => {{
+        #[cfg(feature = "failpoints")]
+        {
+            if let Some(res) = fail::eval($name, $e) {
+                return res;
+            }
+        }
+    }};
+    ($name:expr, $cond:expr, $e:expr) => {{
+        #[cfg(feature = "failpoints")]
+        {
+            if $cond {
+                fail::fail_point!($name, $e);
+            }
+        }
+    }};
+}
+
 #[cfg(test)]
 pub mod tests {
     use common::{BinarySerializable, FixedSize};
+    use query_grammar::{UserInputAst, UserInputLeaf, UserInputLiteral};
     use rand::distributions::{Bernoulli, Uniform};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use time::OffsetDateTime;
 
     use crate::collector::tests::TEST_COLLECTOR_WITH_SCORE;
-    use crate::core::SegmentReader;
     use crate::docset::{DocSet, TERMINATED};
+    use crate::index::SegmentReader;
     use crate::merge_policy::NoMergePolicy;
+    use crate::postings::Postings;
     use crate::query::BooleanQuery;
     use crate::schema::*;
-    use crate::{DateTime, DocAddress, Index, Postings, ReloadPolicy};
+    use crate::{DateTime, DocAddress, Index, IndexWriter, ReloadPolicy};
 
     pub fn fixed_size_test<O: BinarySerializable + FixedSize + Default>() {
         let mut buffer = Vec::new();
@@ -319,16 +397,20 @@ pub mod tests {
     #[macro_export]
     macro_rules! assert_nearly_equals {
         ($left:expr, $right:expr) => {{
-            match (&$left, &$right) {
-                (left_val, right_val) => {
+            assert_nearly_equals!($left, $right, 0.0005);
+        }};
+        ($left:expr, $right:expr, $epsilon:expr) => {{
+            match (&$left, &$right, &$epsilon) {
+                (left_val, right_val, epsilon_val) => {
                     let diff = (left_val - right_val).abs();
-                    let add = left_val.abs() + right_val.abs();
-                    if diff > 0.0005 * add {
+
+                    if diff > *epsilon_val {
                         panic!(
-                            r#"assertion failed: `(left ~= right)`
-  left: `{:?}`,
- right: `{:?}`"#,
-                            &*left_val, &*right_val
+                            r#"assertion failed: `abs(left-right)>epsilon`
+    left: `{:?}`,
+    right: `{:?}`,
+    epsilon: `{:?}`"#,
+                            &*left_val, &*right_val, &*epsilon_val
                         )
                     }
                 }
@@ -358,7 +440,6 @@ pub mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "lz4"))]
     fn test_version_string() {
         use regex::Regex;
         let regex_ptn = Regex::new(
@@ -377,7 +458,7 @@ pub mod tests {
         let schema = schema_builder.build();
         let index = Index::create_from_tempdir(schema)?;
         // writing the segment
-        let mut index_writer = index.writer_for_tests()?;
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
         {
             let doc = doc!(text_field=>"af b");
             index_writer.add_document(doc)?;
@@ -399,7 +480,7 @@ pub mod tests {
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
-        let mut index_writer = index.writer_for_tests()?;
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
         index_writer.add_document(doc!(text_field=>"a b c"))?;
         index_writer.commit()?;
         index_writer.add_document(doc!(text_field=>"a"))?;
@@ -426,7 +507,7 @@ pub mod tests {
         let title_field = schema_builder.add_text_field("title", TEXT);
         let text_field = schema_builder.add_text_field("text", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
-        let mut index_writer = index.writer_for_tests()?;
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
         index_writer.add_document(doc!(text_field=>"a b c"))?;
         index_writer.commit()?;
         let index_reader = index.reader()?;
@@ -448,7 +529,7 @@ pub mod tests {
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
-        let mut index_writer = index.writer_for_tests()?;
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
         index_writer.add_document(doc!(text_field=>"a b c"))?;
         index_writer.add_document(doc!())?;
         index_writer.add_document(doc!(text_field=>"a b"))?;
@@ -491,7 +572,7 @@ pub mod tests {
             .unwrap();
         {
             // writing the segment
-            let mut index_writer = index.writer_for_tests()?;
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
             // 0
             index_writer.add_document(doc!(text_field=>"a b"))?;
             // 1
@@ -538,7 +619,7 @@ pub mod tests {
         }
         {
             // writing the segment
-            let mut index_writer = index.writer_for_tests()?;
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
             // 0
             index_writer.add_document(doc!(text_field=>"a b"))?;
             // 1
@@ -575,7 +656,7 @@ pub mod tests {
         }
         {
             // writing the segment
-            let mut index_writer = index.writer_for_tests()?;
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
             index_writer.add_document(doc!(text_field=>"a b"))?;
             index_writer.delete_term(Term::from_field_text(text_field, "c"));
             index_writer.rollback()?;
@@ -625,7 +706,7 @@ pub mod tests {
         let schema = schema_builder.build();
 
         let index = Index::create_in_ram(schema);
-        let mut index_writer = index.writer_for_tests()?;
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
         index_writer.add_document(doc!(field=>1u64))?;
         index_writer.commit()?;
         let reader = index.reader()?;
@@ -648,7 +729,7 @@ pub mod tests {
         let schema = schema_builder.build();
 
         let index = Index::create_in_ram(schema);
-        let mut index_writer = index.writer_for_tests()?;
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
         let negative_val = -1i64;
         index_writer.add_document(doc!(value_field => negative_val))?;
         index_writer.commit()?;
@@ -672,7 +753,7 @@ pub mod tests {
         let schema = schema_builder.build();
 
         let index = Index::create_in_ram(schema);
-        let mut index_writer = index.writer_for_tests()?;
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
         let val = std::f64::consts::PI;
         index_writer.add_document(doc!(value_field => val))?;
         index_writer.commit()?;
@@ -696,7 +777,7 @@ pub mod tests {
         let absent_field = schema_builder.add_text_field("absent_text", TEXT);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
-        let mut index_writer = index.writer_for_tests()?;
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
         index_writer.add_document(doc!(text_field=>"a"))?;
         assert!(index_writer.commit().is_ok());
         let reader = index.reader()?;
@@ -719,7 +800,7 @@ pub mod tests {
             .try_into()?;
 
         // writing the segment
-        let mut index_writer = index.writer_for_tests()?;
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
         index_writer.add_document(doc!(text_field=>"63"))?;
         index_writer.add_document(doc!(text_field=>"70"))?;
         index_writer.add_document(doc!(text_field=>"34"))?;
@@ -744,7 +825,7 @@ pub mod tests {
         let index = Index::create_in_ram(schema);
         {
             // writing the segment
-            let mut index_writer = index.writer_for_tests()?;
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
             index_writer.add_document(doc!(text_field=>"af af af bc bc"))?;
             index_writer.commit()?;
         }
@@ -776,7 +857,7 @@ pub mod tests {
         let index = Index::create_in_ram(schema);
         let reader = index.reader()?;
         // writing the segment
-        let mut index_writer = index.writer_for_tests()?;
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
         index_writer.add_document(doc!(text_field=>"af af af b"))?;
         index_writer.add_document(doc!(text_field=>"a b c"))?;
         index_writer.add_document(doc!(text_field=>"a b c d"))?;
@@ -840,7 +921,7 @@ pub mod tests {
             .try_into()?;
         assert_eq!(reader.searcher().num_docs(), 0u64);
         // writing the segment
-        let mut index_writer = index.writer_for_tests()?;
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
         index_writer.add_document(doc!(text_field=>"af b"))?;
         index_writer.add_document(doc!(text_field=>"a b c"))?;
         index_writer.add_document(doc!(text_field=>"a b c d"))?;
@@ -848,6 +929,95 @@ pub mod tests {
         reader.reload()?;
         assert_eq!(reader.searcher().num_docs(), 3u64);
         Ok(())
+    }
+
+    #[test]
+    fn test_searcher_on_json_field_with_type_inference() {
+        // When indexing and searching a json value, we infer its type.
+        // This tests aims to check the type infereence is consistent between indexing and search.
+        // Inference order is date, i64, u64, f64, bool.
+        let mut schema_builder = Schema::builder();
+        let json_field = schema_builder.add_json_field("json", STORED | TEXT);
+        let schema = schema_builder.build();
+        let json_val: serde_json::Value = serde_json::from_str(
+            r#"{
+            "signed": 2,
+            "float": 2.0,
+            "unsigned": 10000000000000,
+            "date": "1985-04-12T23:20:50.52Z",
+            "bool": true
+        }"#,
+        )
+        .unwrap();
+        let doc = doc!(json_field=>json_val);
+        let index = Index::create_in_ram(schema);
+        let mut writer = index.writer_for_tests().unwrap();
+        writer.add_document(doc).unwrap();
+        writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let get_doc_ids = |user_input_literal: UserInputLiteral| {
+            let query_parser = crate::query::QueryParser::for_index(&index, Vec::new());
+            let query = query_parser
+                .build_query_from_user_input_ast(UserInputAst::from(UserInputLeaf::Literal(
+                    user_input_literal,
+                )))
+                .unwrap();
+            searcher
+                .search(&query, &TEST_COLLECTOR_WITH_SCORE)
+                .map(|topdocs| topdocs.docs().to_vec())
+                .unwrap()
+        };
+        {
+            let user_input_literal = UserInputLiteral {
+                field_name: Some("json.signed".to_string()),
+                phrase: "2".to_string(),
+                delimiter: crate::query_grammar::Delimiter::None,
+                slop: 0,
+                prefix: false,
+            };
+            assert_eq!(get_doc_ids(user_input_literal), vec![DocAddress::new(0, 0)]);
+        }
+        {
+            let user_input_literal = UserInputLiteral {
+                field_name: Some("json.float".to_string()),
+                phrase: "2.0".to_string(),
+                delimiter: crate::query_grammar::Delimiter::None,
+                slop: 0,
+                prefix: false,
+            };
+            assert_eq!(get_doc_ids(user_input_literal), vec![DocAddress::new(0, 0)]);
+        }
+        {
+            let user_input_literal = UserInputLiteral {
+                field_name: Some("json.date".to_string()),
+                phrase: "1985-04-12T23:20:50.52Z".to_string(),
+                delimiter: crate::query_grammar::Delimiter::None,
+                slop: 0,
+                prefix: false,
+            };
+            assert_eq!(get_doc_ids(user_input_literal), vec![DocAddress::new(0, 0)]);
+        }
+        {
+            let user_input_literal = UserInputLiteral {
+                field_name: Some("json.unsigned".to_string()),
+                phrase: "10000000000000".to_string(),
+                delimiter: crate::query_grammar::Delimiter::None,
+                slop: 0,
+                prefix: false,
+            };
+            assert_eq!(get_doc_ids(user_input_literal), vec![DocAddress::new(0, 0)]);
+        }
+        {
+            let user_input_literal = UserInputLiteral {
+                field_name: Some("json.bool".to_string()),
+                phrase: "true".to_string(),
+                delimiter: crate::query_grammar::Delimiter::None,
+                slop: 0,
+                prefix: false,
+            };
+            assert_eq!(get_doc_ids(user_input_literal), vec![DocAddress::new(0, 0)]);
+        }
     }
 
     #[test]
@@ -859,13 +1029,16 @@ pub mod tests {
                             text_field => "some other value",
                             other_text_field => "short");
         assert_eq!(document.len(), 3);
-        let values: Vec<&Value> = document.get_all(text_field).collect();
+        let values: Vec<OwnedValue> = document.get_all(text_field).map(OwnedValue::from).collect();
         assert_eq!(values.len(), 2);
-        assert_eq!(values[0].as_text(), Some("tantivy"));
-        assert_eq!(values[1].as_text(), Some("some other value"));
-        let values: Vec<&Value> = document.get_all(other_text_field).collect();
+        assert_eq!(values[0].as_ref().as_str(), Some("tantivy"));
+        assert_eq!(values[1].as_ref().as_str(), Some("some other value"));
+        let values: Vec<OwnedValue> = document
+            .get_all(other_text_field)
+            .map(OwnedValue::from)
+            .collect();
         assert_eq!(values.len(), 1);
-        assert_eq!(values[0].as_text(), Some("short"));
+        assert_eq!(values[0].as_ref().as_str(), Some("short"));
     }
 
     #[test]
@@ -879,7 +1052,7 @@ pub mod tests {
         let schema = schema_builder.build();
 
         let index = Index::create_in_ram(schema);
-        let mut index_writer = index.writer_for_tests()?;
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
         {
             let document =
                 doc!(fast_field_unsigned => 4u64, fast_field_signed=>4i64, fast_field_float=>4f64);
@@ -932,9 +1105,9 @@ pub mod tests {
     #[test]
     fn test_update_via_delete_insert() -> crate::Result<()> {
         use crate::collector::Count;
+        use crate::index::SegmentId;
         use crate::indexer::NoMergePolicy;
         use crate::query::AllQuery;
-        use crate::SegmentId;
 
         const DOC_COUNT: u64 = 2u64;
 
@@ -945,7 +1118,7 @@ pub mod tests {
         let index = Index::create_in_ram(schema);
         let index_reader = index.reader()?;
 
-        let mut index_writer = index.writer_for_tests()?;
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
         index_writer.set_merge_policy(Box::new(NoMergePolicy));
 
         for doc_id in 0u64..DOC_COUNT {
@@ -998,7 +1171,7 @@ pub mod tests {
         let body = builder.add_text_field("body", TEXT | STORED);
         let schema = builder.build();
         let index = Index::create_in_dir(&index_path, schema)?;
-        let mut writer = index.writer(50_000_000)?;
+        let mut writer: IndexWriter = index.writer(50_000_000)?;
         writer.set_merge_policy(Box::new(NoMergePolicy));
         for _ in 0..5000 {
             writer.add_document(doc!(body => "foo"))?;
@@ -1023,8 +1196,8 @@ pub mod tests {
         let dt = DateTime::from_utc(now).into_utc();
         assert_eq!(dt.to_ordinal_date(), now.to_ordinal_date());
         assert_eq!(dt.to_hms_micro(), now.to_hms_micro());
-        // We don't store nanosecond level precision.
-        assert_eq!(dt.nanosecond(), now.microsecond() * 1000);
+        // We store nanosecond level precision.
+        assert_eq!(dt.nanosecond(), now.nanosecond());
 
         let dt = DateTime::from_timestamp_secs(now.unix_timestamp()).into_utc();
         assert_eq!(dt.to_ordinal_date(), now.to_ordinal_date());
@@ -1038,7 +1211,7 @@ pub mod tests {
         assert_eq!(dt.to_hms_micro(), now.to_hms_micro());
 
         let dt_from_ts_nanos =
-            OffsetDateTime::from_unix_timestamp_nanos(18446744073709551615i128).unwrap();
+            OffsetDateTime::from_unix_timestamp_nanos(1492432621123456789).unwrap();
         let offset_dt = DateTime::from_utc(dt_from_ts_nanos).into_utc();
         assert_eq!(
             dt_from_ts_nanos.to_ordinal_date(),

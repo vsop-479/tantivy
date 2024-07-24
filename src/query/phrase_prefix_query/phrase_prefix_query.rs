@@ -88,9 +88,6 @@ impl PhrasePrefixQuery {
     /// a specialized type [`PhraseQueryWeight`] instead of a Boxed trait.
     /// If the query was only one term long, this returns `None` wherease [`Query::weight`]
     /// returns a boxed [`RangeWeight`]
-    ///
-    /// Returns `None`, if phrase_terms is empty, which happens if the phrase prefix query was
-    /// built with a single term.
     pub(crate) fn phrase_prefix_query_weight(
         &self,
         enable_scoring: EnableScoring<'_>,
@@ -108,8 +105,8 @@ impl PhrasePrefixQuery {
         if !has_positions {
             let field_name = field_entry.name();
             return Err(crate::TantivyError::SchemaError(format!(
-                "Applied phrase query on field {:?}, which does not have positions indexed",
-                field_name
+                "Applied phrase query on field {field_name:?}, which does not have positions \
+                 indexed"
             )));
         }
         let terms = self.phrase_terms();
@@ -138,24 +135,17 @@ impl Query for PhrasePrefixQuery {
             Ok(Box::new(phrase_weight))
         } else {
             // There are no prefix. Let's just match the suffix.
-            let end_term = if let Some(end_value) = prefix_end(self.prefix.1.value_bytes()) {
-                let mut end_term = Term::with_capacity(end_value.len());
-                end_term.set_field_and_type(self.field, self.prefix.1.typ());
-                end_term.append_bytes(&end_value);
-                Bound::Excluded(end_term)
-            } else {
-                Bound::Unbounded
-            };
+            let end_term =
+                if let Some(end_value) = prefix_end(self.prefix.1.serialized_value_bytes()) {
+                    let mut end_term = Term::with_capacity(end_value.len());
+                    end_term.set_field_and_type(self.field, self.prefix.1.typ());
+                    end_term.append_bytes(&end_value);
+                    Bound::Excluded(end_term)
+                } else {
+                    Bound::Unbounded
+                };
 
-            let mut range_query = RangeQuery::new_term_bounds(
-                enable_scoring
-                    .schema()
-                    .get_field_name(self.field)
-                    .to_owned(),
-                self.prefix.1.typ(),
-                &Bound::Included(self.prefix.1.clone()),
-                &end_term,
-            );
+            let mut range_query = RangeQuery::new(Bound::Included(self.prefix.1.clone()), end_term);
             range_query.limit(self.max_expansions as u64);
             range_query.weight(enable_scoring)
         }

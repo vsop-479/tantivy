@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::{HistogramAggregation, HistogramBounds};
-use crate::aggregation::AggregationError;
+use crate::aggregation::*;
 
 /// DateHistogramAggregation is similar to `HistogramAggregation`, but it can only be used with date
 /// type.
@@ -37,10 +37,10 @@ pub struct DateHistogramAggregationReq {
     interval: Option<String>,
     #[doc(hidden)]
     /// Only for validation
-    date_interval: Option<String>,
+    calendar_interval: Option<String>,
     /// The field to aggregate on.
     pub field: String,
-    /// The format to format dates.
+    /// The format to format dates. Unsupported currently.
     pub format: Option<String>,
     /// The interval to chunk your data range. Each bucket spans a value range of
     /// [0..fixed_interval). Accepted values
@@ -67,6 +67,13 @@ pub struct DateHistogramAggregationReq {
     pub fixed_interval: Option<String>,
     /// Intervals implicitly defines an absolute grid of buckets `[interval * k, interval * (k +
     /// 1))`.
+    ///
+    /// Offset makes it possible to shift this grid into
+    /// `[offset + interval * k, offset + interval * (k + 1))`. Offset has to be in the range [0,
+    /// interval).
+    ///
+    /// The `offset` parameter is has the same syntax as the `fixed_interval` parameter, but
+    /// also allows for negative values.
     pub offset: Option<String>,
     /// The minimum number of documents in a bucket to be returned. Defaults to 0.
     pub min_doc_count: Option<u64>,
@@ -77,7 +84,7 @@ pub struct DateHistogramAggregationReq {
     /// hard_bounds only limits the buckets, to force a range set both extended_bounds and
     /// hard_bounds to the same range.
     ///
-    /// Needs to be provided as timestamp in microseconds precision.
+    /// Needs to be provided as timestamp in millisecond precision.
     ///
     /// ## Example
     /// ```json
@@ -88,7 +95,7 @@ pub struct DateHistogramAggregationReq {
     ///            "interval": "1d",
     ///            "hard_bounds": {
     ///                "min": 0,
-    ///                "max": 1420502400000000
+    ///                "max": 1420502400000
     ///            }
     ///        }
     ///    }
@@ -114,33 +121,32 @@ impl DateHistogramAggregationReq {
         self.validate()?;
         Ok(HistogramAggregation {
             field: self.field.to_string(),
-            interval: parse_into_microseconds(self.fixed_interval.as_ref().unwrap())? as f64,
+            interval: parse_into_milliseconds(self.fixed_interval.as_ref().unwrap())? as f64,
             offset: self
                 .offset
                 .as_ref()
-                .map(|offset| parse_offset_into_microseconds(offset))
+                .map(|offset| parse_offset_into_milliseconds(offset))
                 .transpose()?
                 .map(|el| el as f64),
             min_doc_count: self.min_doc_count,
-            hard_bounds: None,
-            extended_bounds: None,
+            hard_bounds: self.hard_bounds,
+            extended_bounds: self.extended_bounds,
             keyed: self.keyed,
+            is_normalized_to_ns: false,
         })
     }
 
     fn validate(&self) -> crate::Result<()> {
         if let Some(interval) = self.interval.as_ref() {
             return Err(crate::TantivyError::InvalidArgument(format!(
-                "`interval` parameter {:?} in date histogram is unsupported, only \
-                 `fixed_interval` is supported",
-                interval
+                "`interval` parameter {interval:?} in date histogram is unsupported, only \
+                 `fixed_interval` is supported"
             )));
         }
-        if let Some(interval) = self.date_interval.as_ref() {
+        if let Some(interval) = self.calendar_interval.as_ref() {
             return Err(crate::TantivyError::InvalidArgument(format!(
-                "`date_interval` parameter {:?} in date histogram is unsupported, only \
-                 `fixed_interval` is supported",
-                interval
+                "`calendar_interval` parameter {interval:?} in date histogram is unsupported, \
+                 only `fixed_interval` is supported"
             )));
         }
         if self.format.is_some() {
@@ -155,7 +161,7 @@ impl DateHistogramAggregationReq {
             ));
         }
 
-        parse_into_microseconds(self.fixed_interval.as_ref().unwrap())?;
+        parse_into_milliseconds(self.fixed_interval.as_ref().unwrap())?;
 
         Ok(())
     }
@@ -176,9 +182,12 @@ pub enum DateHistogramParseError {
     /// Offset invalid
     #[error("passed offset is invalid {0:?}")]
     InvalidOffset(String),
+    /// Value out of bounds
+    #[error("passed value is out of bounds: {0:?}")]
+    OutOfBounds(String),
 }
 
-fn parse_offset_into_microseconds(input: &str) -> Result<i64, AggregationError> {
+fn parse_offset_into_milliseconds(input: &str) -> Result<i64, AggregationError> {
     let is_sign = |byte| &[byte] == b"-" || &[byte] == b"+";
     if input.is_empty() {
         return Err(DateHistogramParseError::InvalidOffset(input.to_string()).into());
@@ -187,18 +196,18 @@ fn parse_offset_into_microseconds(input: &str) -> Result<i64, AggregationError> 
     let has_sign = is_sign(input.as_bytes()[0]);
     if has_sign {
         let (sign, input) = input.split_at(1);
-        let val = parse_into_microseconds(input)?;
+        let val = parse_into_milliseconds(input)?;
         if sign == "-" {
             Ok(-val)
         } else {
             Ok(val)
         }
     } else {
-        parse_into_microseconds(input)
+        parse_into_milliseconds(input)
     }
 }
 
-fn parse_into_microseconds(input: &str) -> Result<i64, AggregationError> {
+fn parse_into_milliseconds(input: &str) -> Result<i64, AggregationError> {
     let split_boundary = input
         .as_bytes()
         .iter()
@@ -217,73 +226,79 @@ fn parse_into_microseconds(input: &str) -> Result<i64, AggregationError> {
         // here and being defensive does not hurt.
         .map_err(|_err| DateHistogramParseError::NumberMissing(input.to_string()))?;
 
-    let multiplier_from_unit = match unit {
-        "ms" => 1,
-        "s" => 1000,
-        "m" => 60 * 1000,
-        "h" => 60 * 60 * 1000,
-        "d" => 24 * 60 * 60 * 1000,
+    let unit_in_ms = match unit {
+        "ms" | "milliseconds" => 1,
+        "s" | "seconds" => 1000,
+        "m" | "minutes" => 60 * 1000,
+        "h" | "hours" => 60 * 60 * 1000,
+        "d" | "days" => 24 * 60 * 60 * 1000,
         _ => return Err(DateHistogramParseError::UnitNotRecognized(unit.to_string()).into()),
     };
 
-    Ok(number * multiplier_from_unit * 1000)
+    let val = number * unit_in_ms;
+    // The field type is in nanoseconds precision, so validate the value to fit the range
+    val.checked_mul(1_000_000)
+        .ok_or_else(|| DateHistogramParseError::OutOfBounds(input.to_string()))?;
+
+    Ok(val)
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
     use crate::aggregation::agg_req::Aggregations;
     use crate::aggregation::tests::exec_request;
     use crate::indexer::NoMergePolicy;
-    use crate::schema::{Schema, FAST};
-    use crate::Index;
+    use crate::schema::{Schema, FAST, STRING};
+    use crate::{Index, IndexWriter, TantivyDocument};
 
     #[test]
-    fn test_parse_into_microseconds() {
-        assert_eq!(parse_into_microseconds("1m").unwrap(), 60_000_000);
-        assert_eq!(parse_into_microseconds("2m").unwrap(), 120_000_000);
+    fn test_parse_into_millisecs() {
+        assert_eq!(parse_into_milliseconds("1m").unwrap(), 60_000);
+        assert_eq!(parse_into_milliseconds("2m").unwrap(), 120_000);
+        assert_eq!(parse_into_milliseconds("2minutes").unwrap(), 120_000);
         assert_eq!(
-            parse_into_microseconds("2y").unwrap_err(),
+            parse_into_milliseconds("2y").unwrap_err(),
             DateHistogramParseError::UnitNotRecognized("y".to_string()).into()
         );
         assert_eq!(
-            parse_into_microseconds("2000").unwrap_err(),
+            parse_into_milliseconds("2000").unwrap_err(),
             DateHistogramParseError::UnitMissing("2000".to_string()).into()
         );
         assert_eq!(
-            parse_into_microseconds("ms").unwrap_err(),
+            parse_into_milliseconds("ms").unwrap_err(),
             DateHistogramParseError::NumberMissing("ms".to_string()).into()
         );
     }
 
     #[test]
-    fn test_parse_offset_into_microseconds() {
-        assert_eq!(parse_offset_into_microseconds("1m").unwrap(), 60_000_000);
-        assert_eq!(parse_offset_into_microseconds("+1m").unwrap(), 60_000_000);
-        assert_eq!(parse_offset_into_microseconds("-1m").unwrap(), -60_000_000);
-        assert_eq!(parse_offset_into_microseconds("2m").unwrap(), 120_000_000);
-        assert_eq!(parse_offset_into_microseconds("+2m").unwrap(), 120_000_000);
-        assert_eq!(parse_offset_into_microseconds("-2m").unwrap(), -120_000_000);
-        assert_eq!(parse_offset_into_microseconds("-2ms").unwrap(), -2_000);
+    fn test_parse_offset_into_milliseconds() {
+        assert_eq!(parse_offset_into_milliseconds("1m").unwrap(), 60_000);
+        assert_eq!(parse_offset_into_milliseconds("+1m").unwrap(), 60_000);
+        assert_eq!(parse_offset_into_milliseconds("-1m").unwrap(), -60_000);
+        assert_eq!(parse_offset_into_milliseconds("2m").unwrap(), 120_000);
+        assert_eq!(parse_offset_into_milliseconds("+2m").unwrap(), 120_000);
+        assert_eq!(parse_offset_into_milliseconds("-2m").unwrap(), -120_000);
+        assert_eq!(parse_offset_into_milliseconds("-2ms").unwrap(), -2);
         assert_eq!(
-            parse_offset_into_microseconds("2y").unwrap_err(),
+            parse_offset_into_milliseconds("2y").unwrap_err(),
             DateHistogramParseError::UnitNotRecognized("y".to_string()).into()
         );
         assert_eq!(
-            parse_offset_into_microseconds("2000").unwrap_err(),
+            parse_offset_into_milliseconds("2000").unwrap_err(),
             DateHistogramParseError::UnitMissing("2000".to_string()).into()
         );
         assert_eq!(
-            parse_offset_into_microseconds("ms").unwrap_err(),
+            parse_offset_into_milliseconds("ms").unwrap_err(),
             DateHistogramParseError::NumberMissing("ms".to_string()).into()
         );
     }
 
     #[test]
     fn test_parse_into_milliseconds_do_not_accept_non_ascii() {
-        assert!(parse_into_microseconds("１m").is_err());
+        assert!(parse_into_milliseconds("１m").is_err());
     }
 
     pub fn get_test_index_from_docs(
@@ -292,7 +307,9 @@ mod tests {
     ) -> crate::Result<Index> {
         let mut schema_builder = Schema::builder();
         schema_builder.add_date_field("date", FAST);
-        schema_builder.add_text_field("text", FAST);
+        schema_builder.add_json_field("mixed", FAST);
+        schema_builder.add_text_field("text", FAST | STRING);
+        schema_builder.add_text_field("text2", FAST | STRING);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema.clone());
         {
@@ -300,7 +317,7 @@ mod tests {
             index_writer.set_merge_policy(Box::new(NoMergePolicy));
             for values in segment_and_docs {
                 for doc_str in values {
-                    let doc = schema.parse_document(doc_str)?;
+                    let doc = TantivyDocument::parse_json(&schema, doc_str)?;
                     index_writer.add_document(doc)?;
                 }
                 // writing the segment
@@ -312,7 +329,7 @@ mod tests {
                 .searchable_segment_ids()
                 .expect("Searchable segments failed.");
             if segment_ids.len() > 1 {
-                let mut index_writer = index.writer_for_tests()?;
+                let mut index_writer: IndexWriter = index.writer_for_tests()?;
                 index_writer.merge(&segment_ids).wait()?;
                 index_writer.wait_merging_threads()?;
             }
@@ -322,168 +339,318 @@ mod tests {
     }
 
     #[test]
-    fn histogram_test_date_force_merge_segments() -> crate::Result<()> {
+    fn histogram_test_date_force_merge_segments() {
         histogram_test_date_merge_segments(true)
     }
 
     #[test]
-    fn histogram_test_date() -> crate::Result<()> {
+    fn histogram_test_date() {
         histogram_test_date_merge_segments(false)
     }
-    fn histogram_test_date_merge_segments(merge_segments: bool) -> crate::Result<()> {
+
+    fn histogram_test_date_merge_segments(merge_segments: bool) {
         let docs = vec![
             vec![r#"{ "date": "2015-01-01T12:10:30Z", "text": "aaa" }"#],
             vec![r#"{ "date": "2015-01-01T11:11:30Z", "text": "bbb" }"#],
+            vec![r#"{ "date": "2015-01-01T11:11:30Z", "text": "bbb" }"#],
             vec![r#"{ "date": "2015-01-02T00:00:00Z", "text": "bbb" }"#],
             vec![r#"{ "date": "2015-01-06T00:00:00Z", "text": "ccc" }"#],
+            vec![r#"{ "date": "2015-01-06T00:00:00Z", "text": "ccc" }"#],
         ];
+        let index = get_test_index_from_docs(merge_segments, &docs).unwrap();
 
-        let index = get_test_index_from_docs(merge_segments, &docs)?;
-        // 30day + offset
-        let elasticsearch_compatible_json = json!(
-            {
-              "sales_over_time": {
-                "date_histogram": {
-                  "field": "date",
-                  "fixed_interval": "30d",
-                  "offset": "-4d"
-                }
-              }
-            }
-        );
-
-        let agg_req: Aggregations =
-            serde_json::from_str(&serde_json::to_string(&elasticsearch_compatible_json).unwrap())
-                .unwrap();
-        let res = exec_request(agg_req, &index)?;
-        let expected_res = json!({
-          "sales_over_time" : {
-          "buckets" : [
-            {
-              "key_as_string" : "2015-01-01T00:00:00Z",
-              "key" : 1420070400000000.0,
-              "doc_count" : 4
-            }
-          ]
-        }
-        });
-        assert_eq!(res, expected_res);
-
-        // 30day + offset + sub_agg
-        let elasticsearch_compatible_json = json!(
-            {
-              "sales_over_time": {
-                "date_histogram": {
-                  "field": "date",
-                  "fixed_interval": "30d",
-                  "offset": "-4d"
-                },
-                "aggs": {
-                    "texts": {
-                        "terms": {"field": "text"}
+        {
+            // 30day + offset
+            let elasticsearch_compatible_json = json!(
+                {
+                "sales_over_time": {
+                    "date_histogram": {
+                    "field": "date",
+                    "fixed_interval": "30d",
+                    "offset": "-4d"
                     }
                 }
-              }
-            }
-        );
-
-        let agg_req: Aggregations =
-            serde_json::from_str(&serde_json::to_string(&elasticsearch_compatible_json).unwrap())
-                .unwrap();
-        let res = exec_request(agg_req, &index)?;
-        println!("{}", serde_json::to_string_pretty(&res).unwrap());
-        let expected_res = json!({
-          "sales_over_time" : {
-          "buckets" : [
-            {
-              "key_as_string" : "2015-01-01T00:00:00Z",
-              "key" : 1420070400000000.0,
-              "doc_count" : 4,
-              "texts": {
-                  "buckets": [
-                    {
-                      "doc_count": 2,
-                      "key": "bbb"
-                    },
-                    {
-                      "doc_count": 1,
-                      "key": "ccc"
-                    },
-                    {
-                      "doc_count": 1,
-                      "key": "aaa"
-                    }
-                  ],
-                  "doc_count_error_upper_bound": 0,
-                  "sum_other_doc_count": 0
                 }
-            }
-          ]
+            );
+
+            let agg_req: Aggregations = serde_json::from_str(
+                &serde_json::to_string(&elasticsearch_compatible_json).unwrap(),
+            )
+            .unwrap();
+            let res = exec_request(agg_req, &index).unwrap();
+            let expected_res = json!({
+                "sales_over_time" : {
+                    "buckets" : [
+                        {
+                            "key_as_string" : "2015-01-01T00:00:00Z",
+                            "key" : 1420070400000.0,
+                            "doc_count" : 6
+                        }
+                    ]
+                }
+            });
+            assert_eq!(res, expected_res);
         }
-        });
-        assert_eq!(res, expected_res);
 
-        // 1day
-        let elasticsearch_compatible_json = json!(
-            {
-              "sales_over_time": {
-                "date_histogram": {
-                  "field": "date",
-                  "fixed_interval": "1d"
+        {
+            // 30day + offset + sub_agg
+            let elasticsearch_compatible_json = json!(
+                {
+                    "sales_over_time": {
+                        "date_histogram": {
+                        "field": "date",
+                        "fixed_interval": "30d",
+                        "offset": "-4d"
+                        },
+                        "aggs": {
+                            "texts": {
+                                "terms": {"field": "text"}
+                            }
+                        }
+                    }
                 }
-              }
-            }
-        );
+            );
 
-        let agg_req: Aggregations =
-            serde_json::from_str(&serde_json::to_string(&elasticsearch_compatible_json).unwrap())
-                .unwrap();
-        let res = exec_request(agg_req, &index)?;
-        let expected_res = json!( {
-          "sales_over_time": {
-            "buckets": [
-              {
-                "doc_count": 2,
-                "key": 1420070400000000.0,
-                "key_as_string": "2015-01-01T00:00:00Z"
-              },
-              {
-                "doc_count": 1,
-                "key": 1420156800000000.0,
-                "key_as_string": "2015-01-02T00:00:00Z"
-              },
-              {
-                "doc_count": 0,
-                "key": 1420243200000000.0,
-                "key_as_string": "2015-01-03T00:00:00Z"
-              },
-              {
-                "doc_count": 0,
-                "key": 1420329600000000.0,
-                "key_as_string": "2015-01-04T00:00:00Z"
-              },
-              {
-                "doc_count": 0,
-                "key": 1420416000000000.0,
-                "key_as_string": "2015-01-05T00:00:00Z"
-              },
-              {
-                "doc_count": 1,
-                "key": 1420502400000000.0,
-                "key_as_string": "2015-01-06T00:00:00Z"
-              }
-            ]
-          }
-        });
-        assert_eq!(res, expected_res);
+            let agg_req: Aggregations = serde_json::from_str(
+                &serde_json::to_string(&elasticsearch_compatible_json).unwrap(),
+            )
+            .unwrap();
+            let res = exec_request(agg_req, &index).unwrap();
+            let expected_res = json!({
+                "sales_over_time" : {
+                "buckets" : [
+                    {
+                        "key_as_string" : "2015-01-01T00:00:00Z",
+                        "key" : 1420070400000.0,
+                        "doc_count" : 6,
+                        "texts": {
+                            "buckets": [
+                                {
+                                "doc_count": 3,
+                                "key": "bbb"
+                                },
+                                {
+                                "doc_count": 2,
+                                "key": "ccc"
+                                },
+                                {
+                                "doc_count": 1,
+                                "key": "aaa"
+                                }
+                            ],
+                            "doc_count_error_upper_bound": 0,
+                            "sum_other_doc_count": 0
+                            }
+                        }
+                    ]
+                }
+            });
+            assert_eq!(res, expected_res);
+        }
+        {
+            // 1day
+            let elasticsearch_compatible_json = json!(
+                {
+                    "sales_over_time": {
+                        "date_histogram": {
+                            "field": "date",
+                            "fixed_interval": "1d"
+                        }
+                    }
+                }
+            );
 
-        Ok(())
+            let agg_req: Aggregations = serde_json::from_str(
+                &serde_json::to_string(&elasticsearch_compatible_json).unwrap(),
+            )
+            .unwrap();
+            let res = exec_request(agg_req, &index).unwrap();
+            let expected_res = json!( {
+                "sales_over_time": {
+                    "buckets": [
+                        {
+                            "doc_count": 3,
+                            "key": 1420070400000.0,
+                            "key_as_string": "2015-01-01T00:00:00Z"
+                        },
+                        {
+                            "doc_count": 1,
+                            "key": 1420156800000.0,
+                            "key_as_string": "2015-01-02T00:00:00Z"
+                        },
+                        {
+                            "doc_count": 0,
+                            "key": 1420243200000.0,
+                            "key_as_string": "2015-01-03T00:00:00Z"
+                        },
+                        {
+                            "doc_count": 0,
+                            "key": 1420329600000.0,
+                            "key_as_string": "2015-01-04T00:00:00Z"
+                        },
+                        {
+                            "doc_count": 0,
+                            "key": 1420416000000.0,
+                            "key_as_string": "2015-01-05T00:00:00Z"
+                        },
+                        {
+                            "doc_count": 2,
+                            "key": 1420502400000.0,
+                            "key_as_string": "2015-01-06T00:00:00Z"
+                        }
+                    ]
+                }
+            });
+            assert_eq!(res, expected_res);
+        }
+
+        {
+            // 1day + extended_bounds
+            let elasticsearch_compatible_json = json!(
+                {
+                    "sales_over_time": {
+                        "date_histogram": {
+                            "field": "date",
+                            "fixed_interval": "1d",
+                            "extended_bounds": {
+                                "min": 1419984000000.0,
+                                "max": 1420588800000.0
+                            }
+                        }
+                    }
+                }
+            );
+
+            let agg_req: Aggregations = serde_json::from_str(
+                &serde_json::to_string(&elasticsearch_compatible_json).unwrap(),
+            )
+            .unwrap();
+            let res = exec_request(agg_req, &index).unwrap();
+            let expected_res = json!({
+                "sales_over_time" : {
+                    "buckets": [
+                        {
+                            "doc_count": 0,
+                            "key": 1419984000000.0,
+                            "key_as_string": "2014-12-31T00:00:00Z"
+                        },
+                        {
+                            "doc_count": 3,
+                            "key": 1420070400000.0,
+                            "key_as_string": "2015-01-01T00:00:00Z"
+                        },
+                        {
+                            "doc_count": 1,
+                            "key": 1420156800000.0,
+                            "key_as_string": "2015-01-02T00:00:00Z"
+                        },
+                        {
+                            "doc_count": 0,
+                            "key": 1420243200000.0,
+                            "key_as_string": "2015-01-03T00:00:00Z"
+                        },
+                        {
+                            "doc_count": 0,
+                            "key": 1420329600000.0,
+                            "key_as_string": "2015-01-04T00:00:00Z"
+                        },
+                        {
+                            "doc_count": 0,
+                            "key": 1420416000000.0,
+                            "key_as_string": "2015-01-05T00:00:00Z"
+                        },
+                        {
+                            "doc_count": 2,
+                            "key": 1420502400000.0,
+                            "key_as_string": "2015-01-06T00:00:00Z"
+                        },
+                        {
+                            "doc_count": 0,
+                            "key": 1420588800000.0,
+                            "key_as_string": "2015-01-07T00:00:00Z"
+                        }
+                    ]
+                }
+            });
+            assert_eq!(res, expected_res);
+        }
+        {
+            // 1day + hard_bounds + extended_bounds
+            let elasticsearch_compatible_json = json!(
+                {
+                    "sales_over_time": {
+                        "date_histogram": {
+                            "field": "date",
+                            "fixed_interval": "1d",
+                            "hard_bounds": {
+                                "min": 1420156800000.0,
+                                "max": 1420243200000.0
+                            }
+                        }
+                    }
+                }
+            );
+
+            let agg_req: Aggregations = serde_json::from_str(
+                &serde_json::to_string(&elasticsearch_compatible_json).unwrap(),
+            )
+            .unwrap();
+            let res = exec_request(agg_req, &index).unwrap();
+            let expected_res = json!({
+                "sales_over_time" : {
+                    "buckets": [
+                        {
+                            "doc_count": 1,
+                            "key": 1420156800000.0,
+                            "key_as_string": "2015-01-02T00:00:00Z"
+                        }
+                    ]
+                }
+            });
+            assert_eq!(res, expected_res);
+        }
+
+        {
+            // 1day + hard_bounds as Rfc3339
+            let elasticsearch_compatible_json = json!(
+                {
+                    "sales_over_time": {
+                        "date_histogram": {
+                            "field": "date",
+                            "fixed_interval": "1d",
+                            "hard_bounds": {
+                                "min": "2015-01-02T00:00:00Z",
+                                "max": "2015-01-02T12:00:00Z"
+                            }
+                        }
+                    }
+                }
+            );
+
+            let agg_req: Aggregations = serde_json::from_str(
+                &serde_json::to_string(&elasticsearch_compatible_json).unwrap(),
+            )
+            .unwrap();
+            let res = exec_request(agg_req, &index).unwrap();
+            let expected_res = json!({
+                "sales_over_time" : {
+                    "buckets": [
+                        {
+                            "doc_count": 1,
+                            "key": 1420156800000.0,
+                            "key_as_string": "2015-01-02T00:00:00Z"
+                        }
+                    ]
+                }
+            });
+            assert_eq!(res, expected_res);
+        }
     }
     #[test]
-    fn histogram_test_invalid_req() -> crate::Result<()> {
+    fn histogram_test_invalid_req() {
         let docs = vec![];
 
-        let index = get_test_index_from_docs(false, &docs)?;
+        let index = get_test_index_from_docs(false, &docs).unwrap();
         let elasticsearch_compatible_json = json!(
             {
               "sales_over_time": {
@@ -504,7 +671,5 @@ mod tests {
             err.to_string(),
             r#"An invalid argument was passed: '`interval` parameter "30d" in date histogram is unsupported, only `fixed_interval` is supported'"#
         );
-
-        Ok(())
     }
 }

@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use tantivy::collector::TopDocs;
 use tantivy::query::BooleanQuery;
 use tantivy::schema::*;
-use tantivy::{doc, DocId, Index, Score, SegmentReader};
+use tantivy::{doc, DocId, Index, IndexWriter, Score, SegmentReader};
 
 fn main() -> tantivy::Result<()> {
     let mut schema_builder = Schema::builder();
@@ -23,7 +23,7 @@ fn main() -> tantivy::Result<()> {
     let schema = schema_builder.build();
     let index = Index::create_in_ram(schema);
 
-    let mut index_writer = index.writer(30_000_000)?;
+    let mut index_writer: IndexWriter = index.writer(30_000_000)?;
 
     index_writer.add_document(doc!(
         title => "Fried egg",
@@ -51,7 +51,7 @@ fn main() -> tantivy::Result<()> {
     let reader = index.reader()?;
     let searcher = reader.searcher();
     {
-        let facets = vec![
+        let facets = [
             Facet::from("/ingredient/egg"),
             Facet::from("/ingredient/oil"),
             Facet::from("/ingredient/garlic"),
@@ -91,13 +91,11 @@ fn main() -> tantivy::Result<()> {
             .iter()
             .map(|(_, doc_id)| {
                 searcher
-                    .doc(*doc_id)
+                    .doc::<TantivyDocument>(*doc_id)
                     .unwrap()
                     .get_first(title)
+                    .and_then(|v| v.as_str().map(|el| el.to_string()))
                     .unwrap()
-                    .as_text()
-                    .unwrap()
-                    .to_owned()
             })
             .collect();
         assert_eq!(titles, vec!["Fried egg", "Egg rolls"]);

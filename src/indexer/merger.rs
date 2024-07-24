@@ -1,29 +1,25 @@
 use std::sync::Arc;
 
 use columnar::{
-    ColumnType, ColumnValues, ColumnarReader, MergeRowOrder, RowAddr, ShuffleMergeOrder,
-    StackMergeOrder,
+    ColumnType, ColumnarReader, MergeRowOrder, RowAddr, ShuffleMergeOrder, StackMergeOrder,
 };
 use common::ReadOnlyBitSet;
 use itertools::Itertools;
 use measure_time::debug_time;
 
-use crate::core::{Segment, SegmentReader};
 use crate::directory::WritePtr;
 use crate::docset::{DocSet, TERMINATED};
 use crate::error::DataCorruption;
-use crate::fastfield::{AliveBitSet, FastFieldNotAvailableError};
+use crate::fastfield::AliveBitSet;
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders, FieldNormsSerializer, FieldNormsWriter};
+use crate::index::{Segment, SegmentComponent, SegmentReader};
 use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
 use crate::indexer::SegmentSerializer;
 use crate::postings::{InvertedIndexSerializer, Postings, SegmentPostings};
 use crate::schema::{value_type_to_column_type, Field, FieldType, Schema};
 use crate::store::StoreWriter;
 use crate::termdict::{TermMerger, TermOrdinal};
-use crate::{
-    DocAddress, DocId, IndexSettings, IndexSortByField, InvertedIndexReader, Order,
-    SegmentComponent, SegmentOrdinal,
-};
+use crate::{DocAddress, DocId, InvertedIndexReader};
 
 /// Segment's max doc must be `< MAX_DOC_LIMIT`.
 ///
@@ -81,7 +77,6 @@ fn estimate_total_num_tokens(readers: &[SegmentReader], field: Field) -> crate::
 }
 
 pub struct IndexMerger {
-    index_settings: IndexSettings,
     schema: Schema,
     pub(crate) readers: Vec<SegmentReader>,
     max_doc: u32,
@@ -117,7 +112,7 @@ fn convert_to_merge_order(
 ) -> MergeRowOrder {
     match doc_id_mapping.mapping_type() {
         MappingType::Stacked => MergeRowOrder::Stack(StackMergeOrder::stack(columnars)),
-        MappingType::StackedWithDeletes | MappingType::Shuffled => {
+        MappingType::StackedWithDeletes => {
             // RUST/LLVM is amazing. The following conversion is actually a no-op:
             // no allocation, no copy.
             let new_row_id_to_old_row_id: Vec<RowAddr> = doc_id_mapping
@@ -150,13 +145,9 @@ fn extract_fast_field_required_columns(schema: &Schema) -> Vec<(String, ColumnTy
 }
 
 impl IndexMerger {
-    pub fn open(
-        schema: Schema,
-        index_settings: IndexSettings,
-        segments: &[Segment],
-    ) -> crate::Result<IndexMerger> {
+    pub fn open(schema: Schema, segments: &[Segment]) -> crate::Result<IndexMerger> {
         let alive_bitset = segments.iter().map(|_| None).collect_vec();
-        Self::open_with_custom_alive_set(schema, index_settings, segments, alive_bitset)
+        Self::open_with_custom_alive_set(schema, segments, alive_bitset)
     }
 
     // Create merge with a custom delete set.
@@ -173,12 +164,11 @@ impl IndexMerger {
     // segments and partitions them e.g. by a value in a field.
     pub fn open_with_custom_alive_set(
         schema: Schema,
-        index_settings: IndexSettings,
         segments: &[Segment],
         alive_bitset_opt: Vec<Option<AliveBitSet>>,
     ) -> crate::Result<IndexMerger> {
         let mut readers = vec![];
-        for (segment, new_alive_bitset_opt) in segments.iter().zip(alive_bitset_opt.into_iter()) {
+        for (segment, new_alive_bitset_opt) in segments.iter().zip(alive_bitset_opt) {
             if segment.meta().num_docs() > 0 {
                 let reader =
                     SegmentReader::open_with_custom_alive_set(segment, new_alive_bitset_opt)?;
@@ -187,48 +177,19 @@ impl IndexMerger {
         }
 
         let max_doc = readers.iter().map(|reader| reader.num_docs()).sum();
-        if let Some(sort_by_field) = index_settings.sort_by_field.as_ref() {
-            readers = Self::sort_readers_by_min_sort_field(readers, sort_by_field)?;
-        }
         // sort segments by their natural sort setting
         if max_doc >= MAX_DOC_LIMIT {
             let err_msg = format!(
-                "The segment resulting from this merge would have {} docs,which exceeds the limit \
-                 {}.",
-                max_doc, MAX_DOC_LIMIT
+                "The segment resulting from this merge would have {max_doc} docs,which exceeds \
+                 the limit {MAX_DOC_LIMIT}."
             );
             return Err(crate::TantivyError::InvalidArgument(err_msg));
         }
         Ok(IndexMerger {
-            index_settings,
             schema,
             readers,
             max_doc,
         })
-    }
-
-    fn sort_readers_by_min_sort_field(
-        readers: Vec<SegmentReader>,
-        sort_by_field: &IndexSortByField,
-    ) -> crate::Result<Vec<SegmentReader>> {
-        // presort the readers by their min_values, so that when they are disjunct, we can use
-        // the regular merge logic (implicitly sorted)
-        let mut readers_with_min_sort_values = readers
-            .into_iter()
-            .map(|reader| {
-                let accessor = Self::get_sort_field_accessor(&reader, sort_by_field)?;
-                Ok((reader, accessor.min_value()))
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
-        if sort_by_field.order.is_asc() {
-            readers_with_min_sort_values.sort_by_key(|(_, min_val)| *min_val);
-        } else {
-            readers_with_min_sort_values.sort_by_key(|(_, min_val)| std::cmp::Reverse(*min_val));
-        }
-        Ok(readers_with_min_sort_values
-            .into_iter()
-            .map(|(reader, _)| reader)
-            .collect())
     }
 
     fn write_fieldnorms(
@@ -276,128 +237,6 @@ impl IndexMerger {
             fast_field_wrt,
         )?;
         Ok(())
-    }
-
-    /// Checks if the readers are disjunct for their sort property and in the correct order to be
-    /// able to just stack them.
-    pub(crate) fn is_disjunct_and_sorted_on_sort_property(
-        &self,
-        sort_by_field: &IndexSortByField,
-    ) -> crate::Result<bool> {
-        let reader_ordinal_and_field_accessors =
-            self.get_reader_with_sort_field_accessor(sort_by_field)?;
-
-        let everything_is_in_order = reader_ordinal_and_field_accessors
-            .into_iter()
-            .map(|(_, col)| Arc::new(col))
-            .tuple_windows()
-            .all(|(field_accessor1, field_accessor2)| {
-                if sort_by_field.order.is_asc() {
-                    field_accessor1.max_value() <= field_accessor2.min_value()
-                } else {
-                    field_accessor1.min_value() >= field_accessor2.max_value()
-                }
-            });
-        Ok(everything_is_in_order)
-    }
-
-    pub(crate) fn get_sort_field_accessor(
-        reader: &SegmentReader,
-        sort_by_field: &IndexSortByField,
-    ) -> crate::Result<Arc<dyn ColumnValues>> {
-        reader.schema().get_field(&sort_by_field.field)?;
-        let value_accessor = reader
-            .fast_fields()
-            .u64_lenient(&sort_by_field.field)?
-            .ok_or_else(|| FastFieldNotAvailableError {
-                field_name: sort_by_field.field.to_string(),
-            })?;
-        Ok(value_accessor.first_or_default_col(0u64))
-    }
-    /// Collecting value_accessors into a vec to bind the lifetime.
-    pub(crate) fn get_reader_with_sort_field_accessor(
-        &self,
-        sort_by_field: &IndexSortByField,
-    ) -> crate::Result<Vec<(SegmentOrdinal, Arc<dyn ColumnValues>)>> {
-        let reader_ordinal_and_field_accessors = self
-            .readers
-            .iter()
-            .enumerate()
-            .map(|(reader_ordinal, _)| reader_ordinal as SegmentOrdinal)
-            .map(|reader_ordinal: SegmentOrdinal| {
-                let value_accessor = Self::get_sort_field_accessor(
-                    &self.readers[reader_ordinal as usize],
-                    sort_by_field,
-                )?;
-                Ok((reader_ordinal, value_accessor))
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
-        Ok(reader_ordinal_and_field_accessors)
-    }
-
-    /// Generates the doc_id mapping where position in the vec=new
-    /// doc_id.
-    /// ReaderWithOrdinal will include the ordinal position of the
-    /// reader in self.readers.
-    pub(crate) fn generate_doc_id_mapping_with_sort_by_field(
-        &self,
-        sort_by_field: &IndexSortByField,
-    ) -> crate::Result<SegmentDocIdMapping> {
-        let reader_ordinal_and_field_accessors =
-            self.get_reader_with_sort_field_accessor(sort_by_field)?;
-        // Loading the field accessor on demand causes a 15x regression
-
-        // create iterators over segment/sort_accessor/doc_id  tuple
-        let doc_id_reader_pair =
-            reader_ordinal_and_field_accessors
-                .iter()
-                .map(|(reader_ord, ff_reader)| {
-                    let reader = &self.readers[*reader_ord as usize];
-                    reader
-                        .doc_ids_alive()
-                        .map(move |doc_id| (doc_id, reader_ord, ff_reader))
-                });
-
-        let total_num_new_docs = self
-            .readers
-            .iter()
-            .map(|reader| reader.num_docs() as usize)
-            .sum();
-
-        let mut sorted_doc_ids: Vec<DocAddress> = Vec::with_capacity(total_num_new_docs);
-
-        // create iterator tuple of (old doc_id, reader) in order of the new doc_ids
-        sorted_doc_ids.extend(
-            doc_id_reader_pair
-                .into_iter()
-                .kmerge_by(|a, b| {
-                    let val1 = a.2.get_val(a.0);
-                    let val2 = b.2.get_val(b.0);
-                    if sort_by_field.order == Order::Asc {
-                        val1 < val2
-                    } else {
-                        val1 > val2
-                    }
-                })
-                .map(|(doc_id, &segment_ord, _)| DocAddress {
-                    doc_id,
-                    segment_ord,
-                }),
-        );
-
-        let alive_bitsets: Vec<Option<ReadOnlyBitSet>> = self
-            .readers
-            .iter()
-            .map(|segment_reader| {
-                let alive_bitset = segment_reader.alive_bitset()?;
-                Some(alive_bitset.bitset().clone())
-            })
-            .collect();
-        Ok(SegmentDocIdMapping::new(
-            sorted_doc_ids,
-            MappingType::Shuffled,
-            alive_bitsets,
-        ))
     }
 
     /// Creates a mapping if the segments are stacked. this is helpful to merge codelines between
@@ -517,7 +356,6 @@ impl IndexMerger {
         );
 
         let mut segment_postings_containing_the_term: Vec<(usize, SegmentPostings)> = vec![];
-        let mut doc_id_and_positions = vec![];
 
         while merged_terms.advance() {
             segment_postings_containing_the_term.clear();
@@ -553,7 +391,41 @@ impl IndexMerger {
                 continue;
             }
 
-            field_serializer.new_term(term_bytes, total_doc_freq)?;
+            // This should never happen as we early exited for total_doc_freq == 0.
+            assert!(!segment_postings_containing_the_term.is_empty());
+
+            let has_term_freq = {
+                let has_term_freq = !segment_postings_containing_the_term[0]
+                    .1
+                    .block_cursor
+                    .freqs()
+                    .is_empty();
+                for (_, postings) in &segment_postings_containing_the_term[1..] {
+                    // This may look at a strange way to test whether we have term freq or not.
+                    // With JSON object, the schema is not sufficient to know whether a term
+                    // has its term frequency encoded or not:
+                    // strings may have term frequencies, while number terms never have one.
+                    //
+                    // Ideally, we should have burnt one bit of two in the `TermInfo`.
+                    // However, we preferred not changing the codec too much and detect this
+                    // instead by
+                    // - looking at the size of the skip data for bitpacked blocks
+                    // - observing the absence of remaining data after reading the docs for vint
+                    // blocks.
+                    //
+                    // Overall the reliable way to know if we have actual frequencies loaded or not
+                    // is to check whether the actual decoded array is empty or not.
+                    if has_term_freq == postings.block_cursor.freqs().is_empty() {
+                        return Err(DataCorruption::comment_only(
+                            "Term freqs are inconsistent across segments",
+                        )
+                        .into());
+                    }
+                }
+                has_term_freq
+            };
+
+            field_serializer.new_term(term_bytes, total_doc_freq, has_term_freq)?;
 
             // We can now serialize this postings, by pushing each document to the
             // postings serializer.
@@ -568,38 +440,23 @@ impl IndexMerger {
                     if let Some(remapped_doc_id) = old_to_new_doc_id[doc as usize] {
                         // we make sure to only write the term if
                         // there is at least one document.
-                        let term_freq = segment_postings.term_freq();
-                        segment_postings.positions(&mut positions_buffer);
-                        // if doc_id_mapping exists, the doc_ids are reordered, they are
-                        // not just stacked. The field serializer expects monotonically increasing
-                        // doc_ids, so we collect and sort them first, before writing.
-                        //
-                        // I think this is not strictly necessary, it would be possible to
-                        // avoid the loading into a vec via some form of kmerge, but then the merge
-                        // logic would deviate much more from the stacking case (unsorted index)
-                        if !doc_id_mapping.is_trivial() {
-                            doc_id_and_positions.push((
-                                remapped_doc_id,
-                                term_freq,
-                                positions_buffer.to_vec(),
-                            ));
+                        let term_freq = if has_term_freq {
+                            segment_postings.positions(&mut positions_buffer);
+                            segment_postings.term_freq()
                         } else {
-                            let delta_positions = delta_computer.compute_delta(&positions_buffer);
-                            field_serializer.write_doc(remapped_doc_id, term_freq, delta_positions);
-                        }
+                            // The positions_buffer may contain positions from the previous term
+                            // Existence of positions depend on the value type in JSON fields.
+                            // https://github.com/quickwit-oss/tantivy/issues/2283
+                            positions_buffer.clear();
+                            0u32
+                        };
+
+                        let delta_positions = delta_computer.compute_delta(&positions_buffer);
+                        field_serializer.write_doc(remapped_doc_id, term_freq, delta_positions);
                     }
 
                     doc = segment_postings.advance();
                 }
-            }
-            if !doc_id_mapping.is_trivial() {
-                doc_id_and_positions.sort_unstable_by_key(|&(doc_id, _, _)| doc_id);
-
-                for (doc_id, term_freq, positions) in &doc_id_and_positions {
-                    let delta_positions = delta_computer.compute_delta(positions);
-                    field_serializer.write_doc(*doc_id, *term_freq, delta_positions);
-                }
-                doc_id_and_positions.clear();
             }
             // closing the term.
             field_serializer.close_term()?;
@@ -629,47 +486,13 @@ impl IndexMerger {
         Ok(())
     }
 
-    fn write_storable_fields(
-        &self,
-        store_writer: &mut StoreWriter,
-        doc_id_mapping: &SegmentDocIdMapping,
-    ) -> crate::Result<()> {
+    fn write_storable_fields(&self, store_writer: &mut StoreWriter) -> crate::Result<()> {
         debug_time!("write-storable-fields");
         debug!("write-storable-field");
 
-        if !doc_id_mapping.is_trivial() {
-            debug!("non-trivial-doc-id-mapping");
-
-            let store_readers: Vec<_> = self
-                .readers
-                .iter()
-                .map(|reader| reader.get_store_reader(50))
-                .collect::<Result<_, _>>()?;
-
-            let mut document_iterators: Vec<_> = store_readers
-                .iter()
-                .enumerate()
-                .map(|(i, store)| store.iter_raw(self.readers[i].alive_bitset()))
-                .collect();
-
-            for old_doc_addr in doc_id_mapping.iter_old_doc_addrs() {
-                let doc_bytes_it = &mut document_iterators[old_doc_addr.segment_ord as usize];
-                if let Some(doc_bytes_res) = doc_bytes_it.next() {
-                    let doc_bytes = doc_bytes_res?;
-                    store_writer.store_bytes(&doc_bytes)?;
-                } else {
-                    return Err(DataCorruption::comment_only(format!(
-                        "unexpected missing document in docstore on merge, doc address \
-                         {old_doc_addr:?}",
-                    ))
-                    .into());
-                }
-            }
-        } else {
-            debug!("trivial-doc-id-mapping");
-            for reader in &self.readers {
-                let store_reader = reader.get_store_reader(1)?;
-                if reader.has_deletes()
+        for reader in &self.readers {
+            let store_reader = reader.get_store_reader(1)?;
+            if reader.has_deletes()
                     // If there is not enough data in the store, we avoid stacking in order to
                     // avoid creating many small blocks in the doc store. Once we have 5 full blocks,
                     // we start stacking. In the worst case 2/7 of the blocks would be very small.
@@ -685,14 +508,13 @@ impl IndexMerger {
                     // take 7 in order to not walk over all checkpoints.
                     || store_reader.block_checkpoints().take(7).count() < 6
                     || store_reader.decompressor() != store_writer.compressor().into()
-                {
-                    for doc_bytes_res in store_reader.iter_raw(reader.alive_bitset()) {
-                        let doc_bytes = doc_bytes_res?;
-                        store_writer.store_bytes(&doc_bytes)?;
-                    }
-                } else {
-                    store_writer.stack(store_reader)?;
+            {
+                for doc_bytes_res in store_reader.iter_raw(reader.alive_bitset()) {
+                    let doc_bytes = doc_bytes_res?;
+                    store_writer.store_bytes(&doc_bytes)?;
                 }
+            } else {
+                store_writer.stack(store_reader)?;
             }
         }
         Ok(())
@@ -704,18 +526,7 @@ impl IndexMerger {
     /// # Returns
     /// The number of documents in the resulting segment.
     pub fn write(&self, mut serializer: SegmentSerializer) -> crate::Result<u32> {
-        let doc_id_mapping = if let Some(sort_by_field) = self.index_settings.sort_by_field.as_ref()
-        {
-            // If the documents are already sorted and stackable, we ignore the mapping and execute
-            // it as if there was no sorting
-            if self.is_disjunct_and_sorted_on_sort_property(sort_by_field)? {
-                self.get_doc_id_from_concatenated_data()?
-            } else {
-                self.generate_doc_id_mapping_with_sort_by_field(sort_by_field)?
-            }
-        } else {
-            self.get_doc_id_from_concatenated_data()?
-        };
+        let doc_id_mapping = self.get_doc_id_from_concatenated_data()?;
         debug!("write-fieldnorms");
         if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
             self.write_fieldnorms(fieldnorms_serializer, &doc_id_mapping)?;
@@ -732,7 +543,7 @@ impl IndexMerger {
         )?;
 
         debug!("write-storagefields");
-        self.write_storable_fields(serializer.get_store_writer(), &doc_id_mapping)?;
+        self.write_storable_fields(serializer.get_store_writer())?;
         debug!("write-fastfields");
         self.write_fast_fields(serializer.get_fast_field_write(), doc_id_mapping)?;
 
@@ -746,22 +557,25 @@ impl IndexMerger {
 mod tests {
 
     use columnar::Column;
+    use proptest::prop_oneof;
+    use proptest::strategy::Strategy;
     use schema::FAST;
 
     use crate::collector::tests::{
         BytesFastFieldTestCollector, FastFieldTestCollector, TEST_COLLECTOR_WITH_SCORE,
     };
     use crate::collector::{Count, FacetCollector};
-    use crate::core::Index;
+    use crate::index::{Index, SegmentId};
+    use crate::indexer::NoMergePolicy;
     use crate::query::{AllQuery, BooleanQuery, EnableScoring, Scorer, TermQuery};
     use crate::schema::{
-        Document, Facet, FacetOptions, IndexRecordOption, NumericOptions, Term, TextFieldIndexing,
-        INDEXED, TEXT,
+        Facet, FacetOptions, IndexRecordOption, NumericOptions, TantivyDocument, Term,
+        TextFieldIndexing, Value, INDEXED, TEXT,
     };
     use crate::time::OffsetDateTime;
     use crate::{
         assert_nearly_equals, schema, DateTime, DocAddress, DocId, DocSet, IndexSettings,
-        IndexSortByField, IndexWriter, Order, Searcher, SegmentId,
+        IndexWriter, Searcher,
     };
 
     #[test]
@@ -818,7 +632,7 @@ mod tests {
             let segment_ids = index
                 .searchable_segment_ids()
                 .expect("Searchable segments failed.");
-            let mut index_writer = index.writer_for_tests()?;
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
             index_writer.merge(&segment_ids).wait()?;
             index_writer.wait_merging_threads()?;
         }
@@ -867,30 +681,33 @@ mod tests {
                 );
             }
             {
-                let doc = searcher.doc(DocAddress::new(0, 0))?;
-                assert_eq!(doc.get_first(text_field).unwrap().as_text(), Some("af b"));
-            }
-            {
-                let doc = searcher.doc(DocAddress::new(0, 1))?;
-                assert_eq!(doc.get_first(text_field).unwrap().as_text(), Some("a b c"));
-            }
-            {
-                let doc = searcher.doc(DocAddress::new(0, 2))?;
+                let doc = searcher.doc::<TantivyDocument>(DocAddress::new(0, 0))?;
                 assert_eq!(
-                    doc.get_first(text_field).unwrap().as_text(),
+                    doc.get_first(text_field).unwrap().as_value().as_str(),
+                    Some("af b")
+                );
+            }
+            {
+                let doc = searcher.doc::<TantivyDocument>(DocAddress::new(0, 1))?;
+                assert_eq!(
+                    doc.get_first(text_field).unwrap().as_value().as_str(),
+                    Some("a b c")
+                );
+            }
+            {
+                let doc = searcher.doc::<TantivyDocument>(DocAddress::new(0, 2))?;
+                assert_eq!(
+                    doc.get_first(text_field).unwrap().as_value().as_str(),
                     Some("a b c d")
                 );
             }
             {
-                let doc = searcher.doc(DocAddress::new(0, 3))?;
-                assert_eq!(doc.get_first(text_field).unwrap().as_text(), Some("af b"));
+                let doc = searcher.doc::<TantivyDocument>(DocAddress::new(0, 3))?;
+                assert_eq!(doc.get_first(text_field).unwrap().as_str(), Some("af b"));
             }
             {
-                let doc = searcher.doc(DocAddress::new(0, 4))?;
-                assert_eq!(
-                    doc.get_first(text_field).unwrap().as_text(),
-                    Some("a b c g")
-                );
+                let doc = searcher.doc::<TantivyDocument>(DocAddress::new(0, 4))?;
+                assert_eq!(doc.get_first(text_field).unwrap().as_str(), Some("a b c g"));
             }
 
             {
@@ -1231,60 +1048,6 @@ mod tests {
         test_merge_facets(None, true)
     }
 
-    #[test]
-    fn test_merge_facets_sort_asc() {
-        // In the merge case this will go through the doc_id mapping code
-        test_merge_facets(
-            Some(IndexSettings {
-                sort_by_field: Some(IndexSortByField {
-                    field: "intval".to_string(),
-                    order: Order::Desc,
-                }),
-                ..Default::default()
-            }),
-            true,
-        );
-        // In the merge case this will not go through the doc_id mapping code, because the data
-        // sorted and disjunct
-        test_merge_facets(
-            Some(IndexSettings {
-                sort_by_field: Some(IndexSortByField {
-                    field: "intval".to_string(),
-                    order: Order::Desc,
-                }),
-                ..Default::default()
-            }),
-            false,
-        );
-    }
-
-    #[test]
-    fn test_merge_facets_sort_desc() {
-        // In the merge case this will go through the doc_id mapping code
-        test_merge_facets(
-            Some(IndexSettings {
-                sort_by_field: Some(IndexSortByField {
-                    field: "intval".to_string(),
-                    order: Order::Desc,
-                }),
-                ..Default::default()
-            }),
-            true,
-        );
-        // In the merge case this will not go through the doc_id mapping code, because the data
-        // sorted and disjunct
-        test_merge_facets(
-            Some(IndexSettings {
-                sort_by_field: Some(IndexSortByField {
-                    field: "intval".to_string(),
-                    order: Order::Desc,
-                }),
-                ..Default::default()
-            }),
-            false,
-        );
-    }
-
     // force_segment_value_overlap forces the int value for sorting to have overlapping min and max
     // ranges between segments so that merge algorithm can't apply certain optimizations
     fn test_merge_facets(index_settings: Option<IndexSettings>, force_segment_value_overlap: bool) {
@@ -1301,10 +1064,10 @@ mod tests {
         let reader = index.reader().unwrap();
         let mut int_val = 0;
         {
-            let mut index_writer = index.writer_for_tests().unwrap();
+            let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
             let index_doc =
                 |index_writer: &mut IndexWriter, doc_facets: &[&str], int_val: &mut u64| {
-                    let mut doc = Document::default();
+                    let mut doc = TantivyDocument::default();
                     for facet in doc_facets {
                         doc.add_facet(facet_field, Facet::from(facet));
                     }
@@ -1385,7 +1148,7 @@ mod tests {
             let segment_ids = index
                 .searchable_segment_ids()
                 .expect("Searchable segments failed.");
-            let mut index_writer = index.writer_for_tests().unwrap();
+            let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
             index_writer
                 .merge(&segment_ids)
                 .wait()
@@ -1407,7 +1170,7 @@ mod tests {
 
         // Deleting one term
         {
-            let mut index_writer = index.writer_for_tests().unwrap();
+            let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
             let facet = Facet::from_path(vec!["top", "a", "firstdoc"]);
             let facet_term = Term::from_facet(facet_field, &facet);
             index_writer.delete_term(facet_term);
@@ -1432,7 +1195,7 @@ mod tests {
         let mut schema_builder = schema::Schema::builder();
         let int_field = schema_builder.add_u64_field("intvals", INDEXED);
         let index = Index::create_in_ram(schema_builder.build());
-        let mut index_writer = index.writer_for_tests().unwrap();
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
         index_writer.add_document(doc!(int_field => 1u64))?;
         index_writer.commit().expect("commit failed");
         index_writer.add_document(doc!(int_field => 1u64))?;
@@ -1461,7 +1224,7 @@ mod tests {
         let reader = index.reader()?;
         {
             let mut index_writer = index.writer_for_tests()?;
-            let mut doc = Document::default();
+            let mut doc = TantivyDocument::default();
             doc.add_u64(int_field, 1);
             index_writer.add_document(doc.clone())?;
             index_writer.commit()?;
@@ -1487,6 +1250,112 @@ mod tests {
         Ok(())
     }
 
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    enum IndexingOp {
+        ZeroVal,
+        OneVal { val: u64 },
+        TwoVal { val: u64 },
+        Commit,
+    }
+
+    fn balanced_operation_strategy() -> impl Strategy<Value = IndexingOp> {
+        prop_oneof![
+            (0u64..1u64).prop_map(|_| IndexingOp::ZeroVal),
+            (0u64..1u64).prop_map(|val| IndexingOp::OneVal { val }),
+            (0u64..1u64).prop_map(|val| IndexingOp::TwoVal { val }),
+            (0u64..1u64).prop_map(|_| IndexingOp::Commit),
+        ]
+    }
+
+    use proptest::prelude::*;
+    proptest! {
+        #[test]
+        fn test_merge_columnar_int_proptest(ops in proptest::collection::vec(balanced_operation_strategy(), 1..20)) {
+            assert!(test_merge_int_fields(&ops[..]).is_ok());
+        }
+    }
+    fn test_merge_int_fields(ops: &[IndexingOp]) -> crate::Result<()> {
+        if ops.iter().all(|op| *op == IndexingOp::Commit) {
+            return Ok(());
+        }
+        let expected_doc_and_vals: Vec<(u32, Vec<u64>)> = ops
+            .iter()
+            .filter(|op| *op != &IndexingOp::Commit)
+            .map(|op| match op {
+                IndexingOp::ZeroVal => vec![],
+                IndexingOp::OneVal { val } => vec![*val],
+                IndexingOp::TwoVal { val } => vec![*val, *val],
+                IndexingOp::Commit => unreachable!(),
+            })
+            .enumerate()
+            .map(|(id, val)| (id as u32, val))
+            .collect();
+
+        let mut schema_builder = schema::Schema::builder();
+        let int_options = NumericOptions::default().set_fast().set_indexed();
+        let int_field = schema_builder.add_u64_field("intvals", int_options);
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut index_writer = index.writer_for_tests()?;
+            index_writer.set_merge_policy(Box::new(NoMergePolicy));
+            let index_doc = |index_writer: &mut IndexWriter, int_vals: &[u64]| {
+                let mut doc = TantivyDocument::default();
+                for &val in int_vals {
+                    doc.add_u64(int_field, val);
+                }
+                index_writer.add_document(doc).unwrap();
+            };
+
+            for op in ops {
+                match op {
+                    IndexingOp::ZeroVal => index_doc(&mut index_writer, &[]),
+                    IndexingOp::OneVal { val } => index_doc(&mut index_writer, &[*val]),
+                    IndexingOp::TwoVal { val } => index_doc(&mut index_writer, &[*val, *val]),
+                    IndexingOp::Commit => {
+                        index_writer.commit().expect("commit failed");
+                    }
+                }
+            }
+            index_writer.commit().expect("commit failed");
+        }
+        {
+            let mut segment_ids = index.searchable_segment_ids()?;
+            segment_ids.sort();
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            index_writer.merge(&segment_ids).wait()?;
+            index_writer.wait_merging_threads()?;
+        }
+        let reader = index.reader()?;
+        reader.reload()?;
+
+        let mut vals: Vec<u64> = Vec::new();
+        let mut test_vals = move |col: &Column<u64>, doc: DocId, expected: &[u64]| {
+            vals.clear();
+            vals.extend(col.values_for_doc(doc));
+            assert_eq!(&vals[..], expected);
+        };
+
+        let mut test_col = move |col: &Column<u64>, column_expected: &[(u32, Vec<u64>)]| {
+            for (doc_id, vals) in column_expected.iter() {
+                test_vals(col, *doc_id, vals);
+            }
+        };
+
+        {
+            let searcher = reader.searcher();
+            let segment = searcher.segment_reader(0u32);
+            let col = segment
+                .fast_fields()
+                .column_opt::<u64>("intvals")
+                .unwrap()
+                .unwrap();
+
+            test_col(&col, &expected_doc_and_vals);
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn test_merge_multivalued_int_fields_simple() -> crate::Result<()> {
         let mut schema_builder = schema::Schema::builder();
@@ -1504,7 +1373,7 @@ mod tests {
         {
             let mut index_writer = index.writer_for_tests()?;
             let index_doc = |index_writer: &mut IndexWriter, int_vals: &[u64]| {
-                let mut doc = Document::default();
+                let mut doc = TantivyDocument::default();
                 for &val in int_vals {
                     doc.add_u64(int_field, val);
                 }
@@ -1567,7 +1436,7 @@ mod tests {
         // Merging the segments
         {
             let segment_ids = index.searchable_segment_ids()?;
-            let mut index_writer = index.writer_for_tests()?;
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
             index_writer.merge(&segment_ids).wait()?;
             index_writer.wait_merging_threads()?;
         }
@@ -1614,7 +1483,7 @@ mod tests {
         writer.set_merge_policy(Box::new(policy));
 
         for i in 0..100 {
-            let mut doc = Document::new();
+            let mut doc = TantivyDocument::new();
             doc.add_f64(field, 42.0);
             doc.add_f64(multi_field, 0.24);
             doc.add_f64(multi_field, 0.27);

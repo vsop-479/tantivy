@@ -4,13 +4,15 @@ use std::net::Ipv6Addr;
 
 use common::DateTime;
 use proptest::prelude::*;
+use proptest::sample::subsequence;
 
 use crate::column_values::MonotonicallyMappableToU128;
 use crate::columnar::{ColumnType, ColumnTypeCategory};
 use crate::dynamic_column::{DynamicColumn, DynamicColumnHandle};
 use crate::value::{Coerce, NumericalValue};
 use crate::{
-    BytesColumn, Cardinality, Column, ColumnarReader, ColumnarWriter, RowId, StackMergeOrder,
+    BytesColumn, Cardinality, Column, ColumnarReader, ColumnarWriter, RowAddr, RowId,
+    ShuffleMergeOrder, StackMergeOrder,
 };
 
 #[test]
@@ -19,12 +21,12 @@ fn test_dataframe_writer_str() {
     dataframe_writer.record_str(1u32, "my_string", "hello");
     dataframe_writer.record_str(3u32, "my_string", "helloeee");
     let mut buffer: Vec<u8> = Vec::new();
-    dataframe_writer.serialize(5, None, &mut buffer).unwrap();
+    dataframe_writer.serialize(5, &mut buffer).unwrap();
     let columnar = ColumnarReader::open(buffer).unwrap();
     assert_eq!(columnar.num_columns(), 1);
     let cols: Vec<DynamicColumnHandle> = columnar.read_columns("my_string").unwrap();
     assert_eq!(cols.len(), 1);
-    assert_eq!(cols[0].num_bytes(), 89);
+    assert_eq!(cols[0].num_bytes(), 73);
 }
 
 #[test]
@@ -33,12 +35,12 @@ fn test_dataframe_writer_bytes() {
     dataframe_writer.record_bytes(1u32, "my_string", b"hello");
     dataframe_writer.record_bytes(3u32, "my_string", b"helloeee");
     let mut buffer: Vec<u8> = Vec::new();
-    dataframe_writer.serialize(5, None, &mut buffer).unwrap();
+    dataframe_writer.serialize(5, &mut buffer).unwrap();
     let columnar = ColumnarReader::open(buffer).unwrap();
     assert_eq!(columnar.num_columns(), 1);
     let cols: Vec<DynamicColumnHandle> = columnar.read_columns("my_string").unwrap();
     assert_eq!(cols.len(), 1);
-    assert_eq!(cols[0].num_bytes(), 89);
+    assert_eq!(cols[0].num_bytes(), 73);
 }
 
 #[test]
@@ -47,7 +49,7 @@ fn test_dataframe_writer_bool() {
     dataframe_writer.record_bool(1u32, "bool.value", false);
     dataframe_writer.record_bool(3u32, "bool.value", true);
     let mut buffer: Vec<u8> = Vec::new();
-    dataframe_writer.serialize(5, None, &mut buffer).unwrap();
+    dataframe_writer.serialize(5, &mut buffer).unwrap();
     let columnar = ColumnarReader::open(buffer).unwrap();
     assert_eq!(columnar.num_columns(), 1);
     let cols: Vec<DynamicColumnHandle> = columnar.read_columns("bool.value").unwrap();
@@ -55,7 +57,9 @@ fn test_dataframe_writer_bool() {
     assert_eq!(cols[0].num_bytes(), 22);
     assert_eq!(cols[0].column_type(), ColumnType::Bool);
     let dyn_bool_col = cols[0].open().unwrap();
-    let DynamicColumn::Bool(bool_col) = dyn_bool_col else { panic!(); };
+    let DynamicColumn::Bool(bool_col) = dyn_bool_col else {
+        panic!();
+    };
     let vals: Vec<Option<bool>> = (0..5).map(|row_id| bool_col.first(row_id)).collect();
     assert_eq!(&vals, &[None, Some(false), None, Some(true), None,]);
 }
@@ -70,14 +74,16 @@ fn test_dataframe_writer_u64_multivalued() {
     dataframe_writer.record_numerical(6u32, "divisor", 2u64);
     dataframe_writer.record_numerical(6u32, "divisor", 3u64);
     let mut buffer: Vec<u8> = Vec::new();
-    dataframe_writer.serialize(7, None, &mut buffer).unwrap();
+    dataframe_writer.serialize(7, &mut buffer).unwrap();
     let columnar = ColumnarReader::open(buffer).unwrap();
     assert_eq!(columnar.num_columns(), 1);
     let cols: Vec<DynamicColumnHandle> = columnar.read_columns("divisor").unwrap();
     assert_eq!(cols.len(), 1);
-    assert_eq!(cols[0].num_bytes(), 29);
+    assert_eq!(cols[0].num_bytes(), 50);
     let dyn_i64_col = cols[0].open().unwrap();
-    let DynamicColumn::I64(divisor_col) = dyn_i64_col else { panic!(); };
+    let DynamicColumn::I64(divisor_col) = dyn_i64_col else {
+        panic!();
+    };
     assert_eq!(
         divisor_col.get_cardinality(),
         crate::Cardinality::Multivalued
@@ -91,7 +97,7 @@ fn test_dataframe_writer_ip_addr() {
     dataframe_writer.record_ip_addr(1, "ip_addr", Ipv6Addr::from_u128(1001));
     dataframe_writer.record_ip_addr(3, "ip_addr", Ipv6Addr::from_u128(1050));
     let mut buffer: Vec<u8> = Vec::new();
-    dataframe_writer.serialize(5, None, &mut buffer).unwrap();
+    dataframe_writer.serialize(5, &mut buffer).unwrap();
     let columnar = ColumnarReader::open(buffer).unwrap();
     assert_eq!(columnar.num_columns(), 1);
     let cols: Vec<DynamicColumnHandle> = columnar.read_columns("ip_addr").unwrap();
@@ -99,7 +105,9 @@ fn test_dataframe_writer_ip_addr() {
     assert_eq!(cols[0].num_bytes(), 42);
     assert_eq!(cols[0].column_type(), ColumnType::IpAddr);
     let dyn_bool_col = cols[0].open().unwrap();
-    let DynamicColumn::IpAddr(ip_col) = dyn_bool_col else { panic!(); };
+    let DynamicColumn::IpAddr(ip_col) = dyn_bool_col else {
+        panic!();
+    };
     let vals: Vec<Option<Ipv6Addr>> = (0..5).map(|row_id| ip_col.first(row_id)).collect();
     assert_eq!(
         &vals,
@@ -120,7 +128,7 @@ fn test_dataframe_writer_numerical() {
     dataframe_writer.record_numerical(2u32, "srical.value", NumericalValue::U64(13u64));
     dataframe_writer.record_numerical(4u32, "srical.value", NumericalValue::U64(15u64));
     let mut buffer: Vec<u8> = Vec::new();
-    dataframe_writer.serialize(6, None, &mut buffer).unwrap();
+    dataframe_writer.serialize(6, &mut buffer).unwrap();
     let columnar = ColumnarReader::open(buffer).unwrap();
     assert_eq!(columnar.num_columns(), 1);
     let cols: Vec<DynamicColumnHandle> = columnar.read_columns("srical.value").unwrap();
@@ -132,7 +140,9 @@ fn test_dataframe_writer_numerical() {
     // - null footer 6 bytes
     assert_eq!(cols[0].num_bytes(), 33);
     let column = cols[0].open().unwrap();
-    let DynamicColumn::I64(column_i64) = column else { panic!(); };
+    let DynamicColumn::I64(column_i64) = column else {
+        panic!();
+    };
     assert_eq!(column_i64.index.get_cardinality(), Cardinality::Optional);
     assert_eq!(column_i64.first(0), None);
     assert_eq!(column_i64.first(1), Some(12i64));
@@ -151,12 +161,14 @@ fn test_dictionary_encoded_str() {
     columnar_writer.record_str(3, "my.column", "c");
     columnar_writer.record_str(3, "my.column2", "different_column!");
     columnar_writer.record_str(4, "my.column", "b");
-    columnar_writer.serialize(5, None, &mut buffer).unwrap();
+    columnar_writer.serialize(5, &mut buffer).unwrap();
     let columnar_reader = ColumnarReader::open(buffer).unwrap();
     assert_eq!(columnar_reader.num_columns(), 2);
     let col_handles = columnar_reader.read_columns("my.column").unwrap();
     assert_eq!(col_handles.len(), 1);
-    let DynamicColumn::Str(str_col) = col_handles[0].open().unwrap() else  { panic!(); };
+    let DynamicColumn::Str(str_col) = col_handles[0].open().unwrap() else {
+        panic!();
+    };
     let index: Vec<Option<u64>> = (0..5).map(|row_id| str_col.ords().first(row_id)).collect();
     assert_eq!(index, &[None, Some(0), None, Some(2), Some(1)]);
     assert_eq!(str_col.num_rows(), 5);
@@ -183,12 +195,14 @@ fn test_dictionary_encoded_bytes() {
     columnar_writer.record_bytes(3, "my.column", b"c");
     columnar_writer.record_bytes(3, "my.column2", b"different_column!");
     columnar_writer.record_bytes(4, "my.column", b"b");
-    columnar_writer.serialize(5, None, &mut buffer).unwrap();
+    columnar_writer.serialize(5, &mut buffer).unwrap();
     let columnar_reader = ColumnarReader::open(buffer).unwrap();
     assert_eq!(columnar_reader.num_columns(), 2);
     let col_handles = columnar_reader.read_columns("my.column").unwrap();
     assert_eq!(col_handles.len(), 1);
-    let DynamicColumn::Bytes(bytes_col) = col_handles[0].open().unwrap() else  { panic!(); };
+    let DynamicColumn::Bytes(bytes_col) = col_handles[0].open().unwrap() else {
+        panic!();
+    };
     let index: Vec<Option<u64>> = (0..5)
         .map(|row_id| bytes_col.ords().first(row_id))
         .collect();
@@ -220,12 +234,15 @@ fn test_dictionary_encoded_bytes() {
 
 fn num_strategy() -> impl Strategy<Value = NumericalValue> {
     prop_oneof![
-        Just(NumericalValue::U64(0u64)),
-        Just(NumericalValue::U64(u64::MAX)),
-        Just(NumericalValue::I64(0i64)),
-        Just(NumericalValue::I64(i64::MIN)),
-        Just(NumericalValue::I64(i64::MAX)),
-        Just(NumericalValue::F64(1.2f64)),
+        3 => Just(NumericalValue::U64(0u64)),
+        3 => Just(NumericalValue::U64(u64::MAX)),
+        3 => Just(NumericalValue::I64(0i64)),
+        3 => Just(NumericalValue::I64(i64::MIN)),
+        3 => Just(NumericalValue::I64(i64::MAX)),
+        3 => Just(NumericalValue::F64(1.2f64)),
+        1 => any::<f64>().prop_map(NumericalValue::from),
+        1 => any::<u64>().prop_map(NumericalValue::from),
+        1 => any::<i64>().prop_map(NumericalValue::from),
     ]
 }
 
@@ -239,12 +256,18 @@ enum ColumnValue {
     DateTime(DateTime),
 }
 
+impl<T: Into<NumericalValue>> From<T> for ColumnValue {
+    fn from(val: T) -> ColumnValue {
+        ColumnValue::Numerical(val.into())
+    }
+}
+
 impl ColumnValue {
     pub(crate) fn column_type_category(&self) -> ColumnTypeCategory {
         match self {
             ColumnValue::Str(_) => ColumnTypeCategory::Str,
             ColumnValue::Bytes(_) => ColumnTypeCategory::Bytes,
-            ColumnValue::Numerical(numerical_val) => ColumnTypeCategory::Numerical,
+            ColumnValue::Numerical(_) => ColumnTypeCategory::Numerical,
             ColumnValue::IpAddr(_) => ColumnTypeCategory::IpAddr,
             ColumnValue::Bool(_) => ColumnTypeCategory::Bool,
             ColumnValue::DateTime(_) => ColumnTypeCategory::DateTime,
@@ -267,9 +290,9 @@ fn bytes_strategy() -> impl Strategy<Value = &'static [u8]> {
 // A random column value
 fn column_value_strategy() -> impl Strategy<Value = ColumnValue> {
     prop_oneof![
-        10 => string_strategy().prop_map(|s| ColumnValue::Str(s)),
-        1 => bytes_strategy().prop_map(|b| ColumnValue::Bytes(b)),
-        40 => num_strategy().prop_map(|n| ColumnValue::Numerical(n)),
+        10 => string_strategy().prop_map(ColumnValue::Str),
+        1 => bytes_strategy().prop_map(ColumnValue::Bytes),
+        40 => num_strategy().prop_map(ColumnValue::Numerical),
         1 => (1u16..3u16).prop_map(|ip_addr_byte| ColumnValue::IpAddr(Ipv6Addr::new(
             127,
             0,
@@ -280,37 +303,38 @@ fn column_value_strategy() -> impl Strategy<Value = ColumnValue> {
             0,
             ip_addr_byte
         ))),
-        1 => any::<bool>().prop_map(|b| ColumnValue::Bool(b)),
-        1 => (0_679_723_993i64..1_679_723_995i64)
+        1 => any::<bool>().prop_map(ColumnValue::Bool),
+        1 => (679_723_993i64..1_679_723_995i64)
             .prop_map(|val| { ColumnValue::DateTime(DateTime::from_timestamp_secs(val)) })
     ]
 }
 
 // A document contains up to 4 values.
 fn doc_strategy() -> impl Strategy<Value = Vec<(&'static str, ColumnValue)>> {
-    proptest::collection::vec((column_name_strategy(), column_value_strategy()), 0..4)
+    proptest::collection::vec((column_name_strategy(), column_value_strategy()), 0..=4)
+}
+
+fn num_docs_strategy() -> impl Strategy<Value = usize> {
+    prop_oneof!(
+        // We focus heavily on the 0..2 case as we assume it is sufficient to cover all edge cases.
+        0usize..=3usize,
+        // We leave 50% of the effort exploring more defensively.
+        3usize..=12usize
+    )
 }
 
 // A columnar contains up to 2 docs.
 fn columnar_docs_strategy() -> impl Strategy<Value = Vec<Vec<(&'static str, ColumnValue)>>> {
-    proptest::collection::vec(doc_strategy(), 0..=2)
+    num_docs_strategy()
+        .prop_flat_map(|num_docs| proptest::collection::vec(doc_strategy(), num_docs))
 }
 
-fn columnar_docs_and_mapping_strategy(
-) -> impl Strategy<Value = (Vec<Vec<(&'static str, ColumnValue)>>, Vec<RowId>)> {
-    columnar_docs_strategy().prop_flat_map(|docs| {
-        permutation_strategy(docs.len()).prop_map(move |permutation| (docs.clone(), permutation))
-    })
+fn permutation_and_subset_strategy(n: usize) -> impl Strategy<Value = Vec<usize>> {
+    let vals: Vec<usize> = (0..n).collect();
+    subsequence(vals, 0..=n).prop_shuffle()
 }
 
-fn permutation_strategy(n: usize) -> impl Strategy<Value = Vec<RowId>> {
-    Just((0u32..n as RowId).collect()).prop_shuffle()
-}
-
-fn build_columnar_with_mapping(
-    docs: &[Vec<(&'static str, ColumnValue)>],
-    old_to_new_row_ids_opt: Option<&[RowId]>,
-) -> ColumnarReader {
+fn build_columnar_with_mapping(docs: &[Vec<(&'static str, ColumnValue)>]) -> ColumnarReader {
     let num_docs = docs.len() as u32;
     let mut buffer = Vec::new();
     let mut columnar_writer = ColumnarWriter::default();
@@ -338,18 +362,24 @@ fn build_columnar_with_mapping(
             }
         }
     }
-    columnar_writer
-        .serialize(num_docs, old_to_new_row_ids_opt, &mut buffer)
-        .unwrap();
-    let columnar_reader = ColumnarReader::open(buffer).unwrap();
-    columnar_reader
+    columnar_writer.serialize(num_docs, &mut buffer).unwrap();
+
+    ColumnarReader::open(buffer).unwrap()
 }
 
 fn build_columnar(docs: &[Vec<(&'static str, ColumnValue)>]) -> ColumnarReader {
-    build_columnar_with_mapping(docs, None)
+    build_columnar_with_mapping(docs)
 }
 
-fn assert_columnar_eq(left: &ColumnarReader, right: &ColumnarReader) {
+fn assert_columnar_eq_strict(left: &ColumnarReader, right: &ColumnarReader) {
+    assert_columnar_eq(left, right, false);
+}
+
+fn assert_columnar_eq(
+    left: &ColumnarReader,
+    right: &ColumnarReader,
+    lenient_on_numerical_value: bool,
+) {
     assert_eq!(left.num_rows(), right.num_rows());
     let left_columns = left.list_columns().unwrap();
     let right_columns = right.list_columns().unwrap();
@@ -358,10 +388,11 @@ fn assert_columnar_eq(left: &ColumnarReader, right: &ColumnarReader) {
         assert_eq!(left_columns[i].0, right_columns[i].0);
         let left_column = left_columns[i].1.open().unwrap();
         let right_column = right_columns[i].1.open().unwrap();
-        assert_dyn_column_eq(&left_column, &right_column);
+        assert_dyn_column_eq(&left_column, &right_column, lenient_on_numerical_value);
     }
 }
 
+#[track_caller]
 fn assert_column_eq<T: Copy + PartialOrd + Debug + Send + Sync + 'static>(
     left: &Column<T>,
     right: &Column<T>,
@@ -393,7 +424,7 @@ fn assert_bytes_column_eq(left: &BytesColumn, right: &BytesColumn) {
     let num_terms = left.dictionary.num_terms();
     let mut left_terms = left.dictionary.stream().unwrap();
     let mut right_terms = right.dictionary.stream().unwrap();
-    for i in 0..num_terms {
+    for _ in 0..num_terms {
         assert!(left_terms.advance());
         assert!(right_terms.advance());
         assert_eq!(left_terms.key(), right_terms.key());
@@ -402,11 +433,11 @@ fn assert_bytes_column_eq(left: &BytesColumn, right: &BytesColumn) {
     assert!(!right_terms.advance());
 }
 
-fn assert_dyn_column_eq(left_dyn_column: &DynamicColumn, right_dyn_column: &DynamicColumn) {
-    assert_eq!(
-        &left_dyn_column.column_type(),
-        &right_dyn_column.column_type()
-    );
+fn assert_dyn_column_eq(
+    left_dyn_column: &DynamicColumn,
+    right_dyn_column: &DynamicColumn,
+    lenient_on_numerical_value: bool,
+) {
     assert_eq!(
         &left_dyn_column.get_cardinality(),
         &right_dyn_column.get_cardinality()
@@ -436,8 +467,19 @@ fn assert_dyn_column_eq(left_dyn_column: &DynamicColumn, right_dyn_column: &Dyna
         (DynamicColumn::Str(left_col), DynamicColumn::Str(right_col)) => {
             assert_bytes_column_eq(left_col, right_col);
         }
-        _ => {
-            unreachable!()
+        (left, right) => {
+            if lenient_on_numerical_value {
+                assert_eq!(
+                    ColumnTypeCategory::from(left.column_type()),
+                    ColumnTypeCategory::from(right.column_type())
+                );
+            } else {
+                panic!(
+                    "Column type are not the same: {:?} vs {:?}",
+                    left.column_type(),
+                    right.column_type()
+                );
+            }
         }
     }
 }
@@ -448,28 +490,36 @@ trait AssertEqualToColumnValue {
 
 impl AssertEqualToColumnValue for bool {
     fn assert_equal_to_column_value(&self, column_value: &ColumnValue) {
-        let ColumnValue::Bool(val) = column_value else { panic!() };
+        let ColumnValue::Bool(val) = column_value else {
+            panic!()
+        };
         assert_eq!(self, val);
     }
 }
 
 impl AssertEqualToColumnValue for Ipv6Addr {
     fn assert_equal_to_column_value(&self, column_value: &ColumnValue) {
-        let ColumnValue::IpAddr(val) = column_value else { panic!() };
+        let ColumnValue::IpAddr(val) = column_value else {
+            panic!()
+        };
         assert_eq!(self, val);
     }
 }
 
 impl<T: Coerce + PartialEq + Debug + Into<NumericalValue>> AssertEqualToColumnValue for T {
     fn assert_equal_to_column_value(&self, column_value: &ColumnValue) {
-        let ColumnValue::Numerical(num) = column_value else { panic!() };
+        let ColumnValue::Numerical(num) = column_value else {
+            panic!()
+        };
         assert_eq!(self, &T::coerce(*num));
     }
 }
 
 impl AssertEqualToColumnValue for DateTime {
     fn assert_equal_to_column_value(&self, column_value: &ColumnValue) {
-        let ColumnValue::DateTime(dt) = column_value else { panic!() };
+        let ColumnValue::DateTime(dt) = column_value else {
+            panic!()
+        };
         assert_eq!(self, dt);
     }
 }
@@ -531,8 +581,8 @@ fn assert_bytes_column_values(
     assert_eq!(num_non_empty_rows, expected.len());
 }
 
-/// This proptest attempts to create a tiny columnar based of up to 3 rows, and checks that the
-/// resulting columnar matches the row data.
+// This proptest attempts to create a tiny columnar based of up to 3 rows, and checks that the
+// resulting columnar matches the row data.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
     #[test]
@@ -578,57 +628,9 @@ proptest! {
     }
 }
 
-/// Same as `test_single_columnar_builder_proptest` but with a shuffling mapping.
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(500))]
-    #[test]
-    fn test_single_columnar_builder_with_shuffle_proptest((docs, mapping) in columnar_docs_and_mapping_strategy()) {
-        let columnar = build_columnar_with_mapping(&docs[..], Some(&mapping));
-        assert_eq!(columnar.num_rows() as usize, docs.len());
-        let mut expected_columns: HashMap<(&str, ColumnTypeCategory), HashMap<u32, Vec<&ColumnValue>> > = Default::default();
-        for (doc_id, doc_vals) in docs.iter().enumerate() {
-            for (col_name, col_val) in doc_vals {
-                expected_columns
-                    .entry((col_name, col_val.column_type_category()))
-                    .or_default()
-                    .entry(mapping[doc_id])
-                    .or_default()
-                    .push(col_val);
-            }
-        }
-        let column_list = columnar.list_columns().unwrap();
-        assert_eq!(expected_columns.len(), column_list.len());
-        for (column_name, column) in column_list {
-            let dynamic_column = column.open().unwrap();
-            let col_category: ColumnTypeCategory = dynamic_column.column_type().into();
-            let expected_col_values: &HashMap<u32, Vec<&ColumnValue>> = expected_columns.get(&(column_name.as_str(), col_category)).unwrap();
-            for doc_id in 0..columnar.num_rows() {
-                match &dynamic_column {
-                    DynamicColumn::Bool(col) =>
-                        assert_column_values(col, expected_col_values),
-                    DynamicColumn::I64(col) =>
-                        assert_column_values(col, expected_col_values),
-                    DynamicColumn::U64(col) =>
-                        assert_column_values(col, expected_col_values),
-                    DynamicColumn::F64(col) =>
-                        assert_column_values(col, expected_col_values),
-                    DynamicColumn::IpAddr(col) =>
-                        assert_column_values(col, expected_col_values),
-                    DynamicColumn::DateTime(col) =>
-                        assert_column_values(col, expected_col_values),
-                    DynamicColumn::Bytes(col) =>
-                        assert_bytes_column_values(col, expected_col_values, false),
-                    DynamicColumn::Str(col) =>
-                        assert_bytes_column_values(col, expected_col_values, true),
-                }
-            }
-        }
-    }
-}
-
-/// This tests create 2 or 3 random small columnar and attempts to merge them.
-/// It compares the resulting merged dataframe with what would have been obtained by building the
-/// dataframe from the concatenated rows to begin with.
+// This tests create 2 or 3 random small columnar and attempts to merge them.
+// It compares the resulting merged dataframe with what would have been obtained by building the
+// dataframe from the concatenated rows to begin with.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1000))]
     #[test]
@@ -641,9 +643,9 @@ proptest! {
         let stack_merge_order = StackMergeOrder::stack(&columnar_readers_arr[..]).into();
         crate::merge_columnar(&columnar_readers_arr[..], &[], stack_merge_order, &mut output).unwrap();
         let merged_columnar = ColumnarReader::open(output).unwrap();
-        let concat_rows: Vec<Vec<(&'static str, ColumnValue)>> = columnar_docs.iter().cloned().flatten().collect();
+        let concat_rows: Vec<Vec<(&'static str, ColumnValue)>> = columnar_docs.iter().flatten().cloned().collect();
         let expected_merged_columnar = build_columnar(&concat_rows[..]);
-        assert_columnar_eq(&merged_columnar, &expected_merged_columnar);
+        assert_columnar_eq_strict(&merged_columnar, &expected_merged_columnar);
     }
 }
 
@@ -667,9 +669,9 @@ fn test_columnar_merging_empty_columnar() {
     .unwrap();
     let merged_columnar = ColumnarReader::open(output).unwrap();
     let concat_rows: Vec<Vec<(&'static str, ColumnValue)>> =
-        columnar_docs.iter().cloned().flatten().collect();
+        columnar_docs.iter().flatten().cloned().collect();
     let expected_merged_columnar = build_columnar(&concat_rows[..]);
-    assert_columnar_eq(&merged_columnar, &expected_merged_columnar);
+    assert_columnar_eq_strict(&merged_columnar, &expected_merged_columnar);
 }
 
 #[test]
@@ -704,10 +706,181 @@ fn test_columnar_merging_number_columns() {
     .unwrap();
     let merged_columnar = ColumnarReader::open(output).unwrap();
     let concat_rows: Vec<Vec<(&'static str, ColumnValue)>> =
-        columnar_docs.iter().cloned().flatten().collect();
+        columnar_docs.iter().flatten().cloned().collect();
     let expected_merged_columnar = build_columnar(&concat_rows[..]);
-    assert_columnar_eq(&merged_columnar, &expected_merged_columnar);
+    assert_columnar_eq_strict(&merged_columnar, &expected_merged_columnar);
 }
+
 // TODO add non trivial remap and merge
 // TODO test required_columns
 // TODO document edge case: required_columns incompatible with values.
+
+fn columnar_docs_and_remap(
+) -> impl Strategy<Value = (Vec<Vec<Vec<(&'static str, ColumnValue)>>>, Vec<RowAddr>)> {
+    proptest::collection::vec(columnar_docs_strategy(), 2..=3).prop_flat_map(
+        |columnars_docs: Vec<Vec<Vec<(&str, ColumnValue)>>>| {
+            let row_addrs: Vec<RowAddr> = columnars_docs
+                .iter()
+                .enumerate()
+                .flat_map(|(segment_ord, columnar_docs)| {
+                    (0u32..columnar_docs.len() as u32).map(move |row_id| RowAddr {
+                        segment_ord: segment_ord as u32,
+                        row_id,
+                    })
+                })
+                .collect();
+            permutation_and_subset_strategy(row_addrs.len()).prop_map(move |shuffled_subset| {
+                let shuffled_row_addr_subset: Vec<RowAddr> =
+                    shuffled_subset.iter().map(|ord| row_addrs[*ord]).collect();
+                (columnars_docs.clone(), shuffled_row_addr_subset)
+            })
+        },
+    )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1000))]
+    #[test]
+    fn test_columnar_merge_and_remap_proptest((columnar_docs, shuffle_merge_order) in
+columnar_docs_and_remap()) {
+        test_columnar_merge_and_remap(columnar_docs, shuffle_merge_order);
+    }
+}
+
+fn test_columnar_merge_and_remap(
+    columnar_docs: Vec<Vec<Vec<(&'static str, ColumnValue)>>>,
+    shuffle_merge_order: Vec<RowAddr>,
+) {
+    let shuffled_rows: Vec<Vec<(&'static str, ColumnValue)>> = shuffle_merge_order
+        .iter()
+        .map(|row_addr| {
+            columnar_docs[row_addr.segment_ord as usize][row_addr.row_id as usize].clone()
+        })
+        .collect();
+    let expected_merged_columnar = build_columnar(&shuffled_rows[..]);
+    let columnar_readers: Vec<ColumnarReader> = columnar_docs
+        .iter()
+        .map(|docs| build_columnar(&docs[..]))
+        .collect::<Vec<_>>();
+    let columnar_readers_ref: Vec<&ColumnarReader> = columnar_readers.iter().collect();
+    let mut output: Vec<u8> = Vec::new();
+    let segment_num_rows: Vec<RowId> = columnar_docs
+        .iter()
+        .map(|docs| docs.len() as RowId)
+        .collect();
+    let shuffle_merge_order = ShuffleMergeOrder::for_test(&segment_num_rows, shuffle_merge_order);
+    crate::merge_columnar(
+        &columnar_readers_ref[..],
+        &[],
+        shuffle_merge_order.into(),
+        &mut output,
+    )
+    .unwrap();
+    let merged_columnar = ColumnarReader::open(output).unwrap();
+    assert_columnar_eq(&merged_columnar, &expected_merged_columnar, true);
+}
+
+#[test]
+fn test_columnar_merge_and_remap_bug_1() {
+    let columnar_docs = vec![vec![
+        vec![
+            ("c1", ColumnValue::Numerical(NumericalValue::U64(0))),
+            ("c1", ColumnValue::Numerical(NumericalValue::U64(0))),
+        ],
+        vec![],
+    ]];
+    let shuffle_merge_order: Vec<RowAddr> = vec![
+        RowAddr {
+            segment_ord: 0,
+            row_id: 1,
+        },
+        RowAddr {
+            segment_ord: 0,
+            row_id: 0,
+        },
+    ];
+
+    test_columnar_merge_and_remap(columnar_docs, shuffle_merge_order);
+}
+
+#[test]
+fn test_columnar_merge_empty() {
+    let columnar_reader_1 = build_columnar(&[]);
+    let rows: &[Vec<_>] = &[vec![("c1", ColumnValue::Str("a"))]][..];
+    let columnar_reader_2 = build_columnar(rows);
+    let mut output: Vec<u8> = Vec::new();
+    let segment_num_rows: Vec<RowId> = vec![0, 0];
+    let shuffle_merge_order = ShuffleMergeOrder::for_test(&segment_num_rows, vec![]);
+    crate::merge_columnar(
+        &[&columnar_reader_1, &columnar_reader_2],
+        &[],
+        shuffle_merge_order.into(),
+        &mut output,
+    )
+    .unwrap();
+    let merged_columnar = ColumnarReader::open(output).unwrap();
+    assert_eq!(merged_columnar.num_rows(), 0);
+    assert_eq!(merged_columnar.num_columns(), 0);
+}
+
+#[test]
+fn test_columnar_merge_single_str_column() {
+    let columnar_reader_1 = build_columnar(&[]);
+    let rows: &[Vec<_>] = &[vec![("c1", ColumnValue::Str("a"))]][..];
+    let columnar_reader_2 = build_columnar(rows);
+    let mut output: Vec<u8> = Vec::new();
+    let segment_num_rows: Vec<RowId> = vec![0, 1];
+    let shuffle_merge_order = ShuffleMergeOrder::for_test(
+        &segment_num_rows,
+        vec![RowAddr {
+            segment_ord: 1u32,
+            row_id: 0u32,
+        }],
+    );
+    crate::merge_columnar(
+        &[&columnar_reader_1, &columnar_reader_2],
+        &[],
+        shuffle_merge_order.into(),
+        &mut output,
+    )
+    .unwrap();
+    let merged_columnar = ColumnarReader::open(output).unwrap();
+    assert_eq!(merged_columnar.num_rows(), 1);
+    assert_eq!(merged_columnar.num_columns(), 1);
+}
+
+#[test]
+fn test_delete_decrease_cardinality() {
+    let columnar_reader_1 = build_columnar(&[]);
+    let rows: &[Vec<_>] = &[
+        vec![
+            ("c", ColumnValue::from(0i64)),
+            ("c", ColumnValue::from(0i64)),
+        ],
+        vec![("c", ColumnValue::from(0i64))],
+    ][..];
+    // c is multivalued here
+    let columnar_reader_2 = build_columnar(rows);
+    let mut output: Vec<u8> = Vec::new();
+    let shuffle_merge_order = ShuffleMergeOrder::for_test(
+        &[0, 2],
+        vec![RowAddr {
+            segment_ord: 1u32,
+            row_id: 1u32,
+        }],
+    );
+    crate::merge_columnar(
+        &[&columnar_reader_1, &columnar_reader_2],
+        &[],
+        shuffle_merge_order.into(),
+        &mut output,
+    )
+    .unwrap();
+    let merged_columnar = ColumnarReader::open(output).unwrap();
+    assert_eq!(merged_columnar.num_rows(), 1);
+    assert_eq!(merged_columnar.num_columns(), 1);
+    let cols = merged_columnar.read_columns("c").unwrap();
+    assert_eq!(cols.len(), 1);
+    assert_eq!(cols[0].column_type(), ColumnType::I64);
+    assert_eq!(cols[0].open().unwrap().get_cardinality(), Cardinality::Full);
+}

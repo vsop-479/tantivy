@@ -1,3 +1,22 @@
+//! # Tantivy-Columnar
+//!
+//! `tantivy-columnar`provides a columnar storage for tantivy.
+//! The crate allows for efficient read operations on specific columns rather than entire records.
+//!
+//! ## Overview
+//!
+//! - **columnar**: Reading, writing, and merging multiple columns:
+//!   - **[ColumnarWriter]**: Makes it possible to create a new columnar.
+//!   - **[ColumnarReader]**: The ColumnarReader makes it possible to access a set of columns
+//!     associated to field names.
+//!   - **[merge_columnar]**: Contains the functionalities to merge multiple ColumnarReader or
+//!     segments into a single one.
+//!
+//! - **column**: A single column, which contains
+//!     - [column_index]: Resolves the rows for a document id. Manages the cardinality of the
+//!       column.
+//!     - [column_values]: Stores the values of a column in a dense format.
+
 #![cfg_attr(all(feature = "unstable", test), feature(test))]
 
 #[cfg(test)]
@@ -12,7 +31,7 @@ use std::io;
 
 mod block_accessor;
 mod column;
-mod column_index;
+pub mod column_index;
 pub mod column_values;
 mod columnar;
 mod dictionary;
@@ -29,7 +48,7 @@ pub use column_values::{
 };
 pub use columnar::{
     merge_columnar, ColumnType, ColumnarReader, ColumnarWriter, HasAssociatedColumnType,
-    MergeRowOrder, ShuffleMergeOrder, StackMergeOrder,
+    MergeRowOrder, ShuffleMergeOrder, StackMergeOrder, Version, CURRENT_VERSION,
 };
 use sstable::VoidSSTable;
 pub use value::{NumericalType, NumericalValue};
@@ -39,7 +58,7 @@ pub use self::dynamic_column::{DynamicColumn, DynamicColumnHandle};
 pub type RowId = u32;
 pub type DocId = u32;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct RowAddr {
     pub segment_ord: u32,
     pub row_id: RowId,
@@ -94,6 +113,9 @@ impl Cardinality {
     pub fn is_multivalue(&self) -> bool {
         matches!(self, Cardinality::Multivalued)
     }
+    pub fn is_full(&self) -> bool {
+        matches!(self, Cardinality::Full)
+    }
     pub(crate) fn to_code(self) -> u8 {
         self as u8
     }
@@ -109,3 +131,6 @@ impl Cardinality {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod compat_tests;

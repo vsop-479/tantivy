@@ -41,18 +41,19 @@
 /// );
 /// # }
 /// ```
+
 #[macro_export]
 macro_rules! doc(
     () => {
         {
-            ($crate::Document::default())
+            ($crate::TantivyDocument::default())
         }
     }; // avoids a warning due to the useless `mut`.
     ($($field:expr => $value:expr),*) => {
         {
-            let mut document = $crate::Document::default();
+            let mut document = $crate::TantivyDocument::default();
             $(
-                document.add_field_value($field, $value);
+                document.add_field_value($field, &$value);
             )*
             document
         }

@@ -1,20 +1,48 @@
 //! Module for all metric aggregations.
 //!
-//! The aggregations in this family compute metrics, see [super::agg_req::MetricAggregation] for
-//! details.
+//! The aggregations in this family compute metrics based on values extracted
+//! from the documents that are being aggregated. Values are extracted from the fast field of
+//! the document.
+//! Some aggregations output a single numeric metric (e.g. Average) and are called
+//! single-value numeric metrics aggregation, others generate multiple metrics (e.g. Stats) and are
+//! called multi-value numeric metrics aggregation.
+//!
+//! ## Supported Metric Aggregations
+//! - [Average](AverageAggregation)
+//! - [Stats](StatsAggregation)
+//! - [Min](MinAggregation)
+//! - [Max](MaxAggregation)
+//! - [Sum](SumAggregation)
+//! - [Count](CountAggregation)
+//! - [Percentiles](PercentilesAggregationReq)
+
 mod average;
+mod cardinality;
 mod count;
+mod extended_stats;
 mod max;
 mod min;
+mod percentiles;
 mod stats;
 mod sum;
+mod top_hits;
+
+use std::collections::HashMap;
+
 pub use average::*;
+pub use cardinality::*;
 pub use count::*;
+pub use extended_stats::*;
 pub use max::*;
 pub use min::*;
+pub use percentiles::*;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 pub use stats::*;
 pub use sum::*;
+pub use top_hits::*;
+
+use crate::schema::OwnedValue;
 
 /// Single-metric aggregations use this common result structure.
 ///
@@ -37,6 +65,55 @@ impl From<Option<f64>> for SingleMetricResult {
     }
 }
 
+/// This is the wrapper of percentile entries, which can be vector or hashmap
+/// depending on if it's keyed or not.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PercentileValues {
+    /// Vector format percentile entries
+    Vec(Vec<PercentileValuesVecEntry>),
+    /// HashMap format percentile entries. Key is the serialized percentile
+    HashMap(FxHashMap<String, f64>),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// The entry when requesting percentiles with keyed: false
+pub struct PercentileValuesVecEntry {
+    key: f64,
+    value: f64,
+}
+
+/// Single-metric aggregations use this common result structure.
+///
+/// Main reason to wrap it in value is to match elasticsearch output structure.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PercentilesMetricResult {
+    /// The result of the percentile metric.
+    pub values: PercentileValues,
+}
+
+/// The top_hits metric results entry
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TopHitsVecEntry {
+    /// The sort values of the document, depending on the sort criteria in the request.
+    pub sort: Vec<Option<u64>>,
+
+    /// Search results, for queries that include field retrieval requests
+    /// (`docvalue_fields`).
+    #[serde(rename = "docvalue_fields")]
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub doc_value_fields: HashMap<String, OwnedValue>,
+}
+
+/// The top_hits metric aggregation results a list of top hits by sort criteria.
+///
+/// The main reason for wrapping it in `hits` is to match elasticsearch output structure.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TopHitsMetricResult {
+    /// The result of the top_hits metric.
+    pub hits: Vec<TopHitsVecEntry>,
+}
+
 #[cfg(test)]
 mod tests {
     use crate::aggregation::agg_req::Aggregations;
@@ -44,7 +121,7 @@ mod tests {
     use crate::aggregation::AggregationCollector;
     use crate::query::AllQuery;
     use crate::schema::{NumericOptions, Schema};
-    use crate::Index;
+    use crate::{Index, IndexWriter};
 
     #[test]
     fn test_metric_aggregations() {
@@ -52,7 +129,7 @@ mod tests {
         let field_options = NumericOptions::default().set_fast();
         let field = schema_builder.add_f64_field("price", field_options);
         let index = Index::create_in_ram(schema_builder.build());
-        let mut index_writer = index.writer_for_tests().unwrap();
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
 
         for i in 0..3 {
             index_writer

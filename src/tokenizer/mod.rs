@@ -66,7 +66,7 @@
 //! ```rust
 //! use tantivy::tokenizer::*;
 //!
-//! let en_stem = TextAnalyzer::builder(SimpleTokenizer)
+//! let en_stem = TextAnalyzer::builder(SimpleTokenizer::default())
 //!     .filter(RemoveLongFilter::limit(40))
 //!     .filter(LowerCaser)
 //!     .filter(Stemmer::new(Language::English))
@@ -81,7 +81,7 @@
 //! # use tantivy::tokenizer::*;
 //! # use tantivy::Index;
 //! #
-//! let custom_en_tokenizer = SimpleTokenizer;
+//! let custom_en_tokenizer = SimpleTokenizer::default();
 //! # let schema = Schema::builder().build();
 //! let index = Index::create_in_ram(schema);
 //! index.tokenizers()
@@ -113,7 +113,7 @@
 //! let index = Index::create_in_ram(schema);
 //!
 //! // We need to register our tokenizer :
-//! let custom_en_tokenizer = TextAnalyzer::builder(SimpleTokenizer)
+//! let custom_en_tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
 //!     .filter(RemoveLongFilter::limit(40))
 //!     .filter(LowerCaser)
 //!     .build();
@@ -149,12 +149,12 @@ pub use self::ngram_tokenizer::NgramTokenizer;
 pub use self::raw_tokenizer::RawTokenizer;
 pub use self::regex_tokenizer::RegexTokenizer;
 pub use self::remove_long::RemoveLongFilter;
-pub use self::simple_tokenizer::SimpleTokenizer;
+pub use self::simple_tokenizer::{SimpleTokenStream, SimpleTokenizer};
 pub use self::split_compound_words::SplitCompoundWords;
 pub use self::stemmer::{Language, Stemmer};
 pub use self::stop_word_filter::StopWordFilter;
 pub use self::tokenized_string::{PreTokenizedStream, PreTokenizedString};
-pub use self::tokenizer::TextAnalyzer;
+pub use self::tokenizer::{TextAnalyzer, TextAnalyzerBuilder};
 pub use self::tokenizer_manager::TokenizerManager;
 pub use self::whitespace_tokenizer::WhitespaceTokenizer;
 
@@ -177,26 +177,20 @@ pub mod tests {
     pub fn assert_token(token: &Token, position: usize, text: &str, from: usize, to: usize) {
         assert_eq!(
             token.position, position,
-            "expected position {} but {:?}",
-            position, token
+            "expected position {position} but {token:?}"
         );
-        assert_eq!(token.text, text, "expected text {} but {:?}", text, token);
+        assert_eq!(token.text, text, "expected text {text} but {token:?}");
         assert_eq!(
             token.offset_from, from,
-            "expected offset_from {} but {:?}",
-            from, token
+            "expected offset_from {from} but {token:?}"
         );
-        assert_eq!(
-            token.offset_to, to,
-            "expected offset_to {} but {:?}",
-            to, token
-        );
+        assert_eq!(token.offset_to, to, "expected offset_to {to} but {token:?}");
     }
 
     #[test]
-    fn test_raw_tokenizer() {
+    fn test_raw_tokenizer2() {
         let tokenizer_manager = TokenizerManager::default();
-        let en_tokenizer = tokenizer_manager.get("raw").unwrap();
+        let mut en_tokenizer = tokenizer_manager.get("raw").unwrap();
         let mut tokens: Vec<Token> = vec![];
         {
             let mut add_token = |token: &Token| {
@@ -214,7 +208,7 @@ pub mod tests {
     fn test_en_tokenizer() {
         let tokenizer_manager = TokenizerManager::default();
         assert!(tokenizer_manager.get("en_doesnotexist").is_none());
-        let en_tokenizer = tokenizer_manager.get("en_stem").unwrap();
+        let mut en_tokenizer = tokenizer_manager.get("en_stem").unwrap();
         let mut tokens: Vec<Token> = vec![];
         {
             let mut add_token = |token: &Token| {
@@ -237,13 +231,13 @@ pub mod tests {
         let tokenizer_manager = TokenizerManager::default();
         tokenizer_manager.register(
             "el_stem",
-            TextAnalyzer::builder(SimpleTokenizer)
+            TextAnalyzer::builder(SimpleTokenizer::default())
                 .filter(RemoveLongFilter::limit(40))
                 .filter(LowerCaser)
                 .filter(Stemmer::new(Language::Greek))
                 .build(),
         );
-        let en_tokenizer = tokenizer_manager.get("el_stem").unwrap();
+        let mut en_tokenizer = tokenizer_manager.get("el_stem").unwrap();
         let mut tokens: Vec<Token> = vec![];
         {
             let mut add_token = |token: &Token| {
@@ -263,7 +257,7 @@ pub mod tests {
     #[test]
     fn test_tokenizer_empty() {
         let tokenizer_manager = TokenizerManager::default();
-        let en_tokenizer = tokenizer_manager.get("en_stem").unwrap();
+        let mut en_tokenizer = tokenizer_manager.get("en_stem").unwrap();
         {
             let mut tokens: Vec<Token> = vec![];
             {
@@ -289,7 +283,7 @@ pub mod tests {
     #[test]
     fn test_whitespace_tokenizer() {
         let tokenizer_manager = TokenizerManager::default();
-        let ws_tokenizer = tokenizer_manager.get("whitespace").unwrap();
+        let mut ws_tokenizer = tokenizer_manager.get("whitespace").unwrap();
         let mut tokens: Vec<Token> = vec![];
         {
             let mut add_token = |token: &Token| {

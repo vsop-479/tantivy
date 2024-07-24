@@ -1,5 +1,5 @@
-use crate::core::SegmentReader;
-use crate::docset::{DocSet, BUFFER_LEN, TERMINATED};
+use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
+use crate::index::SegmentReader;
 use crate::query::boost_query::BoostScorer;
 use crate::query::explanation::does_not_match;
 use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
@@ -22,10 +22,7 @@ pub struct AllWeight;
 
 impl Weight for AllWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
-        let all_scorer = AllScorer {
-            doc: 0u32,
-            max_doc: reader.max_doc(),
-        };
+        let all_scorer = AllScorer::new(reader.max_doc());
         Ok(Box::new(BoostScorer::new(all_scorer, boost)))
     }
 
@@ -43,6 +40,13 @@ pub struct AllScorer {
     max_doc: DocId,
 }
 
+impl AllScorer {
+    /// Creates a new AllScorer with `max_doc` docs.
+    pub fn new(max_doc: DocId) -> AllScorer {
+        AllScorer { doc: 0u32, max_doc }
+    }
+}
+
 impl DocSet for AllScorer {
     #[inline(always)]
     fn advance(&mut self) -> DocId {
@@ -54,7 +58,7 @@ impl DocSet for AllScorer {
         self.doc
     }
 
-    fn fill_buffer(&mut self, buffer: &mut [DocId; BUFFER_LEN]) -> usize {
+    fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
         if self.doc() == TERMINATED {
             return 0;
         }
@@ -96,17 +100,17 @@ impl Scorer for AllScorer {
 #[cfg(test)]
 mod tests {
     use super::AllQuery;
-    use crate::docset::{DocSet, BUFFER_LEN, TERMINATED};
+    use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
     use crate::query::{AllScorer, EnableScoring, Query};
     use crate::schema::{Schema, TEXT};
-    use crate::Index;
+    use crate::{Index, IndexWriter};
 
     fn create_test_index() -> crate::Result<Index> {
         let mut schema_builder = Schema::builder();
         let field = schema_builder.add_text_field("text", TEXT);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
-        let mut index_writer = index.writer_for_tests()?;
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
         index_writer.add_document(doc!(field=>"aaa"))?;
         index_writer.add_document(doc!(field=>"bbb"))?;
         index_writer.commit()?;
@@ -162,16 +166,16 @@ mod tests {
     pub fn test_fill_buffer() {
         let mut postings = AllScorer {
             doc: 0u32,
-            max_doc: BUFFER_LEN as u32 * 2 + 9,
+            max_doc: COLLECT_BLOCK_BUFFER_LEN as u32 * 2 + 9,
         };
-        let mut buffer = [0u32; BUFFER_LEN];
-        assert_eq!(postings.fill_buffer(&mut buffer), BUFFER_LEN);
-        for i in 0u32..BUFFER_LEN as u32 {
+        let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
+        assert_eq!(postings.fill_buffer(&mut buffer), COLLECT_BLOCK_BUFFER_LEN);
+        for i in 0u32..COLLECT_BLOCK_BUFFER_LEN as u32 {
             assert_eq!(buffer[i as usize], i);
         }
-        assert_eq!(postings.fill_buffer(&mut buffer), BUFFER_LEN);
-        for i in 0u32..BUFFER_LEN as u32 {
-            assert_eq!(buffer[i as usize], i + BUFFER_LEN as u32);
+        assert_eq!(postings.fill_buffer(&mut buffer), COLLECT_BLOCK_BUFFER_LEN);
+        for i in 0u32..COLLECT_BLOCK_BUFFER_LEN as u32 {
+            assert_eq!(buffer[i as usize], i + COLLECT_BLOCK_BUFFER_LEN as u32);
         }
         assert_eq!(postings.fill_buffer(&mut buffer), 9);
     }

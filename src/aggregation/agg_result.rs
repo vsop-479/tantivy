@@ -7,12 +7,11 @@
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
-use super::agg_req::BucketAggregationInternal;
 use super::bucket::GetDocCount;
-use super::intermediate_agg_result::{IntermediateBucketResult, IntermediateMetricResult};
-use super::metric::{SingleMetricResult, Stats};
-use super::segment_agg_result::AggregationLimits;
-use super::Key;
+use super::metric::{
+    ExtendedStats, PercentilesMetricResult, SingleMetricResult, Stats, TopHitsMetricResult,
+};
+use super::{AggregationError, Key};
 use crate::TantivyError;
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
@@ -37,8 +36,7 @@ impl AggregationResults {
         } else {
             // Validation is be done during request parsing, so we can't reach this state.
             Err(TantivyError::InternalError(format!(
-                "Can't find aggregation {:?} in sub-aggregations",
-                name
+                "Can't find aggregation {name:?} in sub-aggregations"
             )))
         }
     }
@@ -92,8 +90,16 @@ pub enum MetricResult {
     Min(SingleMetricResult),
     /// Stats metric result.
     Stats(Stats),
+    /// ExtendedStats metric result.
+    ExtendedStats(Box<ExtendedStats>),
     /// Sum metric result.
     Sum(SingleMetricResult),
+    /// Percentiles metric result.
+    Percentiles(PercentilesMetricResult),
+    /// Top hits metric result
+    TopHits(TopHitsMetricResult),
+    /// Cardinality metric result
+    Cardinality(SingleMetricResult),
 }
 
 impl MetricResult {
@@ -104,31 +110,15 @@ impl MetricResult {
             MetricResult::Max(max) => Ok(max.value),
             MetricResult::Min(min) => Ok(min.value),
             MetricResult::Stats(stats) => stats.get_value(agg_property),
+            MetricResult::ExtendedStats(extended_stats) => extended_stats.get_value(agg_property),
             MetricResult::Sum(sum) => Ok(sum.value),
-        }
-    }
-}
-impl From<IntermediateMetricResult> for MetricResult {
-    fn from(metric: IntermediateMetricResult) -> Self {
-        match metric {
-            IntermediateMetricResult::Average(intermediate_avg) => {
-                MetricResult::Average(intermediate_avg.finalize().into())
-            }
-            IntermediateMetricResult::Count(intermediate_count) => {
-                MetricResult::Count(intermediate_count.finalize().into())
-            }
-            IntermediateMetricResult::Max(intermediate_max) => {
-                MetricResult::Max(intermediate_max.finalize().into())
-            }
-            IntermediateMetricResult::Min(intermediate_min) => {
-                MetricResult::Min(intermediate_min.finalize().into())
-            }
-            IntermediateMetricResult::Stats(intermediate_stats) => {
-                MetricResult::Stats(intermediate_stats.finalize())
-            }
-            IntermediateMetricResult::Sum(intermediate_sum) => {
-                MetricResult::Sum(intermediate_sum.finalize().into())
-            }
+            MetricResult::Percentiles(_) => Err(TantivyError::AggregationError(
+                AggregationError::InvalidRequest("percentiles can't be used to order".to_string()),
+            )),
+            MetricResult::TopHits(_) => Err(TantivyError::AggregationError(
+                AggregationError::InvalidRequest("top_hits can't be used to order".to_string()),
+            )),
+            MetricResult::Cardinality(card) => Ok(card.value),
         }
     }
 }
@@ -182,14 +172,6 @@ impl BucketResult {
                 doc_count_error_upper_bound: _,
             } => buckets.iter().map(|bucket| bucket.get_bucket_count()).sum(),
         }
-    }
-
-    pub(crate) fn empty_from_req(
-        req: &BucketAggregationInternal,
-        limits: &AggregationLimits,
-    ) -> crate::Result<Self> {
-        let empty_bucket = IntermediateBucketResult::empty_from_req(&req.bucket_agg);
-        empty_bucket.into_final_bucket_result(req, limits)
     }
 }
 

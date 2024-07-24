@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::directory::error::Incompatibility;
 use crate::directory::{AntiCallToken, FileSlice, TerminatingWrite};
-use crate::{Version, INDEX_FORMAT_VERSION};
+use crate::{Version, INDEX_FORMAT_OLDEST_SUPPORTED_VERSION, INDEX_FORMAT_VERSION};
 
 const FOOTER_MAX_LEN: u32 = 50_000;
 
@@ -73,9 +73,9 @@ impl Footer {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "Footer seems invalid as it suggests a footer len of {}. File is corrupted, \
-                     or the index was created with a different & old version of tantivy.",
-                    footer_len
+                    "Footer seems invalid as it suggests a footer len of {footer_len}. File is \
+                     corrupted, or the index was created with a different & old version of \
+                     tantivy."
                 ),
             ));
         }
@@ -84,8 +84,8 @@ impl Footer {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 format!(
-                    "File corrupted. The file is smaller than it's footer bytes (len={}).",
-                    total_footer_size
+                    "File corrupted. The file is smaller than it's footer bytes \
+                     (len={total_footer_size})."
                 ),
             ));
         }
@@ -102,10 +102,11 @@ impl Footer {
     /// Confirms that the index will be read correctly by this version of tantivy
     /// Has to be called after `extract_footer` to make sure it's not accessing uninitialised memory
     pub fn is_compatible(&self) -> Result<(), Incompatibility> {
+        const SUPPORTED_INDEX_FORMAT_VERSION_RANGE: std::ops::RangeInclusive<u32> =
+            INDEX_FORMAT_OLDEST_SUPPORTED_VERSION..=INDEX_FORMAT_VERSION;
+
         let library_version = crate::version();
-        if self.version.index_format_version < 4
-            || self.version.index_format_version > INDEX_FORMAT_VERSION
-        {
+        if !SUPPORTED_INDEX_FORMAT_VERSION_RANGE.contains(&self.version.index_format_version) {
             return Err(Incompatibility::IndexMismatch {
                 library_version: library_version.clone(),
                 index_version: self.version.clone(),

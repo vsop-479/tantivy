@@ -1,6 +1,6 @@
 use super::{prefix_end, PhrasePrefixScorer};
-use crate::core::SegmentReader;
 use crate::fieldnorm::FieldNormReader;
+use crate::index::SegmentReader;
 use crate::postings::SegmentPostings;
 use crate::query::bm25::Bm25Weight;
 use crate::query::explanation::does_not_match;
@@ -78,8 +78,11 @@ impl PhrasePrefixWeight {
         }
 
         let inv_index = reader.inverted_index(self.prefix.1.field())?;
-        let mut stream = inv_index.terms().range().ge(self.prefix.1.value_bytes());
-        if let Some(end) = prefix_end(self.prefix.1.value_bytes()) {
+        let mut stream = inv_index
+            .terms()
+            .range()
+            .ge(self.prefix.1.serialized_value_bytes());
+        if let Some(end) = prefix_end(self.prefix.1.serialized_value_bytes()) {
             stream = stream.lt(&end);
         }
 
@@ -154,11 +157,11 @@ impl Weight for PhrasePrefixWeight {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::Index;
     use crate::docset::TERMINATED;
+    use crate::index::Index;
     use crate::query::{EnableScoring, PhrasePrefixQuery, Query};
     use crate::schema::{Schema, TEXT};
-    use crate::{DocSet, Term};
+    use crate::{DocSet, IndexWriter, Term};
 
     pub fn create_index(texts: &[&'static str]) -> crate::Result<Index> {
         let mut schema_builder = Schema::builder();
@@ -166,7 +169,7 @@ mod tests {
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
         {
-            let mut index_writer = index.writer_for_tests()?;
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
             for &text in texts {
                 let doc = doc!(text_field=>text);
                 index_writer.add_document(doc)?;
@@ -252,6 +255,24 @@ mod tests {
         assert_eq!(phrase_scorer.doc(), 1);
         assert_eq!(phrase_scorer.advance(), 2);
         assert_eq!(phrase_scorer.doc(), 2);
+        assert_eq!(phrase_scorer.advance(), TERMINATED);
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_phrase_no_match() -> crate::Result<()> {
+        let index = create_index(&["aa dd", "aa aa bb c dd aa bb cc aa dc", " aa bb cd"])?;
+        let schema = index.schema();
+        let text_field = schema.get_field("text").unwrap();
+        let searcher = index.reader()?.searcher();
+        let phrase_query = PhrasePrefixQuery::new(vec![
+            Term::from_field_text(text_field, "aa"),
+            Term::from_field_text(text_field, "cc"),
+            Term::from_field_text(text_field, "d"),
+        ]);
+        let enable_scoring = EnableScoring::enabled_from_searcher(&searcher);
+        let weight = phrase_query.weight(enable_scoring).unwrap();
+        let mut phrase_scorer = weight.scorer(searcher.segment_reader(0u32), 1.0)?;
         assert_eq!(phrase_scorer.advance(), TERMINATED);
         Ok(())
     }

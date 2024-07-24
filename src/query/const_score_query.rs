@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::docset::BUFFER_LEN;
+use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
 use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
 
@@ -72,8 +72,7 @@ impl Weight for ConstWeight {
         let mut scorer = self.scorer(reader, 1.0)?;
         if scorer.seek(doc) != doc {
             return Err(TantivyError::InvalidArgument(format!(
-                "Document #({}) does not match",
-                doc
+                "Document #({doc}) does not match"
             )));
         }
         let mut explanation = Explanation::new("Const", self.score);
@@ -120,7 +119,7 @@ impl<TDocSet: DocSet> DocSet for ConstScorer<TDocSet> {
         self.docset.seek(target)
     }
 
-    fn fill_buffer(&mut self, buffer: &mut [DocId; BUFFER_LEN]) -> usize {
+    fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
         self.docset.fill_buffer(buffer)
     }
 
@@ -144,14 +143,14 @@ mod tests {
     use super::ConstScoreQuery;
     use crate::query::{AllQuery, Query};
     use crate::schema::Schema;
-    use crate::{DocAddress, Document, Index};
+    use crate::{DocAddress, Index, IndexWriter, TantivyDocument};
 
     #[test]
     fn test_const_score_query_explain() -> crate::Result<()> {
         let schema = Schema::builder().build();
         let index = Index::create_in_ram(schema);
-        let mut index_writer = index.writer_for_tests()?;
-        index_writer.add_document(Document::new())?;
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        index_writer.add_document(TantivyDocument::new())?;
         index_writer.commit()?;
         let reader = index.reader()?;
         let searcher = reader.searcher();
@@ -165,11 +164,9 @@ mod tests {
   "details": [
     {
       "value": 1.0,
-      "description": "AllQuery",
-      "context": []
+      "description": "AllQuery"
     }
-  ],
-  "context": []
+  ]
 }"#
         );
         Ok(())

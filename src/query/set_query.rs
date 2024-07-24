@@ -47,8 +47,12 @@ impl TermSetQuery {
             // In practice this won't fail because:
             // - we are writing to memory, so no IoError
             // - Terms are ordered
-            let map = Map::from_iter(sorted_terms.iter().map(|key| (key.value_bytes(), 0)))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let map = Map::from_iter(
+                sorted_terms
+                    .iter()
+                    .map(|key| (key.serialized_value_bytes(), 0)),
+            )
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
             sub_queries.push((
                 Occur::Should,
@@ -67,6 +71,14 @@ impl TermSetQuery {
 impl Query for TermSetQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         Ok(Box::new(self.specialized_weight(enable_scoring.schema())?))
+    }
+
+    fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
+        for terms in self.terms_map.values() {
+            for term in terms {
+                visitor(term, false);
+            }
+        }
     }
 }
 
@@ -104,7 +116,7 @@ mod tests {
     use crate::collector::TopDocs;
     use crate::query::{QueryParser, TermSetQuery};
     use crate::schema::{Schema, TEXT};
-    use crate::{assert_nearly_equals, Index, Term};
+    use crate::{assert_nearly_equals, Index, IndexWriter, Term};
 
     #[test]
     pub fn test_term_set_query() -> crate::Result<()> {
@@ -114,7 +126,7 @@ mod tests {
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
         {
-            let mut index_writer = index.writer_for_tests()?;
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
             index_writer.add_document(doc!(
                 field1 => "doc1",
                 field2 => "val1",
@@ -221,7 +233,7 @@ mod tests {
         schema_builder.add_text_field("field", TEXT);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema.clone());
-        let mut index_writer = index.writer_for_tests()?;
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
         let field = schema.get_field("field").unwrap();
         index_writer.add_document(doc!(
           field => "val1",

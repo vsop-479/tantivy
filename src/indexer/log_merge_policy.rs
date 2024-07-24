@@ -3,7 +3,7 @@ use std::cmp;
 use itertools::Itertools;
 
 use super::merge_policy::{MergeCandidate, MergePolicy};
-use crate::core::SegmentMeta;
+use crate::index::SegmentMeta;
 
 const DEFAULT_LEVEL_LOG_SIZE: f64 = 0.75;
 const DEFAULT_MIN_LAYER_SIZE: u32 = 10_000;
@@ -144,8 +144,7 @@ mod tests {
     use once_cell::sync::Lazy;
 
     use super::*;
-    use crate::core::{SegmentId, SegmentMeta, SegmentMetaInventory};
-    use crate::indexer::merge_policy::MergePolicy;
+    use crate::index::{SegmentId, SegmentMetaInventory};
     use crate::schema;
     use crate::schema::INDEXED;
 
@@ -171,7 +170,7 @@ mod tests {
             index_writer.set_merge_policy(Box::new(log_merge_policy));
 
             // after every commit the merge checker is started, it will merge only segments with 1
-            // element in it because of the max_merge_size.
+            // element in it because of the max_docs_before_merge.
             index_writer.add_document(doc!(int_field=>1_u64))?;
             index_writer.commit()?;
 

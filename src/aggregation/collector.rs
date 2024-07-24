@@ -6,9 +6,10 @@ use super::intermediate_agg_result::IntermediateAggregationResults;
 use super::segment_agg_result::{
     build_segment_agg_collector, AggregationLimits, SegmentAggregationCollector,
 };
-use crate::aggregation::agg_req_with_accessor::get_aggs_with_accessor_and_validate;
+use crate::aggregation::agg_req_with_accessor::get_aggs_with_segment_accessor_and_validate;
 use crate::collector::{Collector, SegmentCollector};
-use crate::{DocId, SegmentReader, TantivyError};
+use crate::index::SegmentReader;
+use crate::{DocId, SegmentOrdinal, TantivyError};
 
 /// The default max bucket count, before the aggregation fails.
 pub const DEFAULT_BUCKET_LIMIT: u32 = 65000;
@@ -64,10 +65,15 @@ impl Collector for DistributedAggregationCollector {
 
     fn for_segment(
         &self,
-        _segment_local_id: crate::SegmentOrdinal,
+        segment_local_id: crate::SegmentOrdinal,
         reader: &crate::SegmentReader,
     ) -> crate::Result<Self::Child> {
-        AggregationSegmentCollector::from_agg_req_and_reader(&self.agg, reader, &self.limits)
+        AggregationSegmentCollector::from_agg_req_and_reader(
+            &self.agg,
+            reader,
+            segment_local_id,
+            &self.limits,
+        )
     }
 
     fn requires_scoring(&self) -> bool {
@@ -89,10 +95,15 @@ impl Collector for AggregationCollector {
 
     fn for_segment(
         &self,
-        _segment_local_id: crate::SegmentOrdinal,
+        segment_local_id: crate::SegmentOrdinal,
         reader: &crate::SegmentReader,
     ) -> crate::Result<Self::Child> {
-        AggregationSegmentCollector::from_agg_req_and_reader(&self.agg, reader, &self.limits)
+        AggregationSegmentCollector::from_agg_req_and_reader(
+            &self.agg,
+            reader,
+            segment_local_id,
+            &self.limits,
+        )
     }
 
     fn requires_scoring(&self) -> bool {
@@ -104,7 +115,7 @@ impl Collector for AggregationCollector {
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
     ) -> crate::Result<Self::Fruit> {
         let res = merge_fruits(segment_fruits)?;
-        res.into_final_bucket_result(self.agg.clone(), &self.limits)
+        res.into_final_result(self.agg.clone(), &self.limits)
     }
 }
 
@@ -114,7 +125,7 @@ fn merge_fruits(
     if let Some(fruit) = segment_fruits.pop() {
         let mut fruit = fruit?;
         for next_fruit in segment_fruits {
-            fruit.merge_fruits(next_fruit?);
+            fruit.merge_fruits(next_fruit?)?;
         }
         Ok(fruit)
     } else {
@@ -135,11 +146,13 @@ impl AggregationSegmentCollector {
     pub fn from_agg_req_and_reader(
         agg: &Aggregations,
         reader: &SegmentReader,
+        segment_ordinal: SegmentOrdinal,
         limits: &AggregationLimits,
     ) -> crate::Result<Self> {
-        let aggs_with_accessor = get_aggs_with_accessor_and_validate(agg, reader, limits)?;
+        let mut aggs_with_accessor =
+            get_aggs_with_segment_accessor_and_validate(agg, reader, segment_ordinal, limits)?;
         let result =
-            BufAggregationCollector::new(build_segment_agg_collector(&aggs_with_accessor)?);
+            BufAggregationCollector::new(build_segment_agg_collector(&mut aggs_with_accessor)?);
         Ok(AggregationSegmentCollector {
             aggs_with_accessor,
             agg_collector: result,
@@ -184,6 +197,13 @@ impl SegmentCollector for AggregationSegmentCollector {
             return Err(err);
         }
         self.agg_collector.flush(&mut self.aggs_with_accessor)?;
-        Box::new(self.agg_collector).into_intermediate_aggregations_result(&self.aggs_with_accessor)
+
+        let mut sub_aggregation_res = IntermediateAggregationResults::default();
+        Box::new(self.agg_collector).add_intermediate_aggregation_result(
+            &self.aggs_with_accessor,
+            &mut sub_aggregation_res,
+        )?;
+
+        Ok(sub_aggregation_res)
     }
 }

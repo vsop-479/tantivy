@@ -1,39 +1,59 @@
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 use std::marker::PhantomData;
 
-use crate::{DocAddress, DocId, SegmentOrdinal, SegmentReader};
+use serde::{Deserialize, Serialize};
+
+use super::top_score_collector::TopNComputer;
+use crate::index::SegmentReader;
+use crate::{DocAddress, DocId, SegmentOrdinal};
 
 /// Contains a feature (field, score, etc.) of a document along with the document address.
 ///
-/// It has a custom implementation of `PartialOrd` that reverses the order. This is because the
-/// default Rust heap is a max heap, whereas a min heap is needed.
-///
-/// Additionally, it guarantees stable sorting: in case of a tie on the feature, the document
+/// It guarantees stable sorting: in case of a tie on the feature, the document
 /// address is used.
+///
+/// The REVERSE_ORDER generic parameter controls whether the by-feature order
+/// should be reversed, which is useful for achieving for example largest-first
+/// semantics without having to wrap the feature in a `Reverse`.
 ///
 /// WARNING: equality is not what you would expect here.
 /// Two elements are equal if their feature is equal, and regardless of whether `doc`
 /// is equal. This should be perfectly fine for this usage, but let's make sure this
 /// struct is never public.
-pub(crate) struct ComparableDoc<T, D> {
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct ComparableDoc<T, D, const REVERSE_ORDER: bool = false> {
+    /// The feature of the document. In practice, this is
+    /// is any type that implements `PartialOrd`.
     pub feature: T,
+    /// The document address. In practice, this is any
+    /// type that implements `PartialOrd`, and is guaranteed
+    /// to be unique for each document.
     pub doc: D,
 }
+impl<T: std::fmt::Debug, D: std::fmt::Debug, const R: bool> std::fmt::Debug
+    for ComparableDoc<T, D, R>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(format!("ComparableDoc<_, _ {R}").as_str())
+            .field("feature", &self.feature)
+            .field("doc", &self.doc)
+            .finish()
+    }
+}
 
-impl<T: PartialOrd, D: PartialOrd> PartialOrd for ComparableDoc<T, D> {
+impl<T: PartialOrd, D: PartialOrd, const R: bool> PartialOrd for ComparableDoc<T, D, R> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<T: PartialOrd, D: PartialOrd> Ord for ComparableDoc<T, D> {
+impl<T: PartialOrd, D: PartialOrd, const R: bool> Ord for ComparableDoc<T, D, R> {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        // Reversed to make BinaryHeap work as a min-heap
-        let by_feature = other
+        let by_feature = self
             .feature
-            .partial_cmp(&self.feature)
+            .partial_cmp(&other.feature)
+            .map(|ord| if R { ord.reverse() } else { ord })
             .unwrap_or(Ordering::Equal);
 
         let lazy_by_doc_address = || self.doc.partial_cmp(&other.doc).unwrap_or(Ordering::Equal);
@@ -45,13 +65,13 @@ impl<T: PartialOrd, D: PartialOrd> Ord for ComparableDoc<T, D> {
     }
 }
 
-impl<T: PartialOrd, D: PartialOrd> PartialEq for ComparableDoc<T, D> {
+impl<T: PartialOrd, D: PartialOrd, const R: bool> PartialEq for ComparableDoc<T, D, R> {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
     }
 }
 
-impl<T: PartialOrd, D: PartialOrd> Eq for ComparableDoc<T, D> {}
+impl<T: PartialOrd, D: PartialOrd, const R: bool> Eq for ComparableDoc<T, D, R> {}
 
 pub(crate) struct TopCollector<T> {
     pub limit: usize,
@@ -91,18 +111,13 @@ where T: PartialOrd + Clone
         if self.limit == 0 {
             return Ok(Vec::new());
         }
-        let mut top_collector = BinaryHeap::new();
+        let mut top_collector: TopNComputer<_, _> = TopNComputer::new(self.limit + self.offset);
         for child_fruit in children {
             for (feature, doc) in child_fruit {
-                if top_collector.len() < (self.limit + self.offset) {
-                    top_collector.push(ComparableDoc { feature, doc });
-                } else if let Some(mut head) = top_collector.peek_mut() {
-                    if head.feature < feature {
-                        *head = ComparableDoc { feature, doc };
-                    }
-                }
+                top_collector.push(feature, doc);
             }
         }
+
         Ok(top_collector
             .into_sorted_vec()
             .into_iter()
@@ -111,7 +126,7 @@ where T: PartialOrd + Clone
             .collect())
     }
 
-    pub(crate) fn for_segment<F: PartialOrd>(
+    pub(crate) fn for_segment<F: PartialOrd + Clone>(
         &self,
         segment_id: SegmentOrdinal,
         _: &SegmentReader,
@@ -136,20 +151,20 @@ where T: PartialOrd + Clone
 /// The Top Collector keeps track of the K documents
 /// sorted by type `T`.
 ///
-/// The implementation is based on a `BinaryHeap`.
+/// The implementation is based on a repeatedly truncating on the median after K * 2 documents
 /// The theoretical complexity for collecting the top `K` out of `n` documents
-/// is `O(n log K)`.
+/// is `O(n + K)`.
 pub(crate) struct TopSegmentCollector<T> {
-    limit: usize,
-    heap: BinaryHeap<ComparableDoc<T, DocId>>,
+    /// We reverse the order of the feature in order to
+    /// have top-semantics instead of bottom semantics.
+    topn_computer: TopNComputer<T, DocId>,
     segment_ord: u32,
 }
 
-impl<T: PartialOrd> TopSegmentCollector<T> {
+impl<T: PartialOrd + Clone> TopSegmentCollector<T> {
     fn new(segment_ord: SegmentOrdinal, limit: usize) -> TopSegmentCollector<T> {
         TopSegmentCollector {
-            limit,
-            heap: BinaryHeap::with_capacity(limit),
+            topn_computer: TopNComputer::new(limit),
             segment_ord,
         }
     }
@@ -158,7 +173,7 @@ impl<T: PartialOrd> TopSegmentCollector<T> {
 impl<T: PartialOrd + Clone> TopSegmentCollector<T> {
     pub fn harvest(self) -> Vec<(T, DocAddress)> {
         let segment_ord = self.segment_ord;
-        self.heap
+        self.topn_computer
             .into_sorted_vec()
             .into_iter()
             .map(|comparable_doc| {
@@ -173,33 +188,13 @@ impl<T: PartialOrd + Clone> TopSegmentCollector<T> {
             .collect()
     }
 
-    /// Return true if more documents have been collected than the limit.
-    #[inline]
-    pub(crate) fn at_capacity(&self) -> bool {
-        self.heap.len() >= self.limit
-    }
-
     /// Collects a document scored by the given feature
     ///
     /// It collects documents until it has reached the max capacity. Once it reaches capacity, it
     /// will compare the lowest scoring item with the given one and keep whichever is greater.
     #[inline]
     pub fn collect(&mut self, doc: DocId, feature: T) {
-        if self.at_capacity() {
-            // It's ok to unwrap as long as a limit of 0 is forbidden.
-            if let Some(limit_feature) = self.heap.peek().map(|head| head.feature.clone()) {
-                if limit_feature < feature {
-                    if let Some(mut head) = self.heap.peek_mut() {
-                        head.feature = feature;
-                        head.doc = doc;
-                    }
-                }
-            }
-        } else {
-            // we have not reached capacity yet, so we can just push the
-            // element.
-            self.heap.push(ComparableDoc { feature, doc });
-        }
+        self.topn_computer.push(feature, doc);
     }
 }
 

@@ -1,3 +1,5 @@
+use std::ops::Bound;
+
 // # Searching a range on an indexed int field.
 //
 // Below is an example of creating an indexed integer field in your schema
@@ -5,7 +7,7 @@
 use tantivy::collector::Count;
 use tantivy::query::RangeQuery;
 use tantivy::schema::{Schema, INDEXED};
-use tantivy::{doc, Index, Result};
+use tantivy::{doc, Index, IndexWriter, Result, Term};
 
 fn main() -> Result<()> {
     // For the sake of simplicity, this schema will only have 1 field
@@ -17,7 +19,7 @@ fn main() -> Result<()> {
     let index = Index::create_in_ram(schema);
     let reader = index.reader()?;
     {
-        let mut index_writer = index.writer_with_num_threads(1, 6_000_000)?;
+        let mut index_writer: IndexWriter = index.writer_with_num_threads(1, 6_000_000)?;
         for year in 1950u64..2019u64 {
             index_writer.add_document(doc!(year_field => year))?;
         }
@@ -27,7 +29,10 @@ fn main() -> Result<()> {
     reader.reload()?;
     let searcher = reader.searcher();
     // The end is excluded i.e. here we are searching up to 1969
-    let docs_in_the_sixties = RangeQuery::new_u64("year".to_string(), 1960..1970);
+    let docs_in_the_sixties = RangeQuery::new(
+        Bound::Included(Term::from_field_u64(year_field, 1960)),
+        Bound::Excluded(Term::from_field_u64(year_field, 1970)),
+    );
     // Uses a Count collector to sum the total number of docs in the range
     let num_60s_books = searcher.search(&docs_in_the_sixties, &Count)?;
     assert_eq!(num_60s_books, 10);

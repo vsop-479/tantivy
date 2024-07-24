@@ -1,9 +1,12 @@
 use std::ops::BitOr;
 
-pub use common::DatePrecision;
+pub use common::DateTimePrecision;
 use serde::{Deserialize, Serialize};
 
 use crate::schema::flags::{FastFlag, IndexedFlag, SchemaFlagList, StoredFlag};
+
+/// The precision of the indexed date/time values in the inverted index.
+pub const DATE_TIME_PRECISION_INDEXED: DateTimePrecision = DateTimePrecision::Seconds;
 
 /// Defines how DateTime field should be handled by tantivy.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -17,26 +20,30 @@ pub struct DateOptions {
     // Internal storage precision, used to optimize storage
     // compression on fast fields.
     #[serde(default)]
-    precision: DatePrecision,
+    precision: DateTimePrecision,
 }
 
 impl DateOptions {
     /// Returns true iff the value is stored.
+    #[inline]
     pub fn is_stored(&self) -> bool {
         self.stored
     }
 
     /// Returns true iff the value is indexed and therefore searchable.
+    #[inline]
     pub fn is_indexed(&self) -> bool {
         self.indexed
     }
 
     /// Returns true iff the field has fieldnorm.
+    #[inline]
     pub fn fieldnorms(&self) -> bool {
         self.fieldnorms && self.indexed
     }
 
     /// Returns true iff the value is a fast field.
+    #[inline]
     pub fn is_fast(&self) -> bool {
         self.fast
     }
@@ -73,23 +80,21 @@ impl DateOptions {
         self
     }
 
-    /// Set the field as a single-valued fast field.
+    /// Set the field as a fast field.
     ///
     /// Fast fields are designed for random access.
-    /// Access time are similar to a random lookup in an array.
-    /// If more than one value is associated with a fast field, only the last one is
-    /// kept.
     #[must_use]
     pub fn set_fast(mut self) -> DateOptions {
         self.fast = true;
         self
     }
 
-    /// Sets the precision for this DateTime field.
+    /// Sets the precision for this DateTime field on the fast field.
+    /// Indexed precision is always [`DATE_TIME_PRECISION_INDEXED`].
     ///
     /// Internal storage precision, used to optimize storage
     /// compression on fast fields.
-    pub fn set_precision(mut self, precision: DatePrecision) -> DateOptions {
+    pub fn set_precision(mut self, precision: DateTimePrecision) -> DateOptions {
         self.precision = precision;
         self
     }
@@ -98,7 +103,7 @@ impl DateOptions {
     ///
     /// Internal storage precision, used to optimize storage
     /// compression on fast fields.
-    pub fn get_precision(&self) -> DatePrecision {
+    pub fn get_precision(&self) -> DateTimePrecision {
         self.precision
     }
 }

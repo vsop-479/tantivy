@@ -11,6 +11,7 @@ use crate::directory::error::{
     Incompatibility, LockError, OpenDirectoryError, OpenReadError, OpenWriteError,
 };
 use crate::fastfield::FastFieldNotAvailableError;
+use crate::schema::document::DeserializeError;
 use crate::{query, schema};
 
 /// Represents a `DataCorruption` error.
@@ -44,7 +45,7 @@ impl fmt::Debug for DataCorruption {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         write!(f, "Data corruption")?;
         if let Some(ref filepath) = &self.filepath {
-            write!(f, " (in file `{:?}`)", filepath)?;
+            write!(f, " (in file `{filepath:?}`)")?;
         }
         write!(f, ": {}.", self.comment)?;
         Ok(())
@@ -106,6 +107,9 @@ pub enum TantivyError {
     /// e.g. a datastructure is incorrectly inititalized.
     #[error("Internal error: '{0}'")]
     InternalError(String),
+    #[error("Deserialize error: {0}")]
+    /// An error occurred while attempting to deserialize a document.
+    DeserializeError(DeserializeError),
 }
 
 impl From<io::Error> for TantivyError {
@@ -120,7 +124,7 @@ impl From<DataCorruption> for TantivyError {
 }
 impl From<FastFieldNotAvailableError> for TantivyError {
     fn from(fastfield_error: FastFieldNotAvailableError) -> TantivyError {
-        TantivyError::SchemaError(format!("{}", fastfield_error))
+        TantivyError::SchemaError(format!("{fastfield_error}"))
     }
 }
 impl From<LockError> for TantivyError {
@@ -131,7 +135,7 @@ impl From<LockError> for TantivyError {
 
 impl From<query::QueryParserError> for TantivyError {
     fn from(parsing_error: query::QueryParserError) -> TantivyError {
-        TantivyError::InvalidArgument(format!("Query is invalid. {:?}", parsing_error))
+        TantivyError::InvalidArgument(format!("Query is invalid. {parsing_error:?}"))
     }
 }
 
@@ -161,7 +165,7 @@ impl From<time::error::ComponentRange> for TantivyError {
 
 impl From<schema::DocParsingError> for TantivyError {
     fn from(error: schema::DocParsingError) -> TantivyError {
-        TantivyError::InvalidArgument(format!("Failed to parse document {:?}", error))
+        TantivyError::InvalidArgument(format!("Failed to parse document {error:?}"))
     }
 }
 
@@ -174,5 +178,11 @@ impl From<serde_json::Error> for TantivyError {
 impl From<rayon::ThreadPoolBuildError> for TantivyError {
     fn from(error: rayon::ThreadPoolBuildError) -> TantivyError {
         TantivyError::SystemError(error.to_string())
+    }
+}
+
+impl From<DeserializeError> for TantivyError {
+    fn from(error: DeserializeError) -> TantivyError {
+        TantivyError::DeserializeError(error)
     }
 }

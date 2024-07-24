@@ -1,6 +1,5 @@
 mod warming;
 
-use std::convert::TryInto;
 use std::sync::atomic::AtomicU64;
 use std::sync::{atomic, Arc, Weak};
 
@@ -28,7 +27,7 @@ pub enum ReloadPolicy {
     Manual,
     /// The index is reloaded within milliseconds after a new commit is available.
     /// This is made possible by watching changes in the `meta.json` file.
-    OnCommit, // TODO add NEAR_REAL_TIME(target_ms)
+    OnCommitWithDelay, // TODO add NEAR_REAL_TIME(target_ms)
 }
 
 /// [`IndexReader`] builder
@@ -51,7 +50,7 @@ impl IndexReaderBuilder {
     #[must_use]
     pub(crate) fn new(index: Index) -> IndexReaderBuilder {
         IndexReaderBuilder {
-            reload_policy: ReloadPolicy::OnCommit,
+            reload_policy: ReloadPolicy::OnCommitWithDelay,
             index,
             warmers: Vec::new(),
             num_warming_threads: 1,
@@ -83,7 +82,7 @@ impl IndexReaderBuilder {
                 // No need to set anything...
                 None
             }
-            ReloadPolicy::OnCommit => {
+            ReloadPolicy::OnCommitWithDelay => {
                 let inner_reader_arc_clone = inner_reader_arc.clone();
                 let callback = move || {
                     if let Err(err) = inner_reader_arc_clone.reload() {
@@ -191,7 +190,7 @@ impl InnerIndexReader {
     }
     /// Opens the freshest segments [`SegmentReader`].
     ///
-    /// This function acquires a lot to prevent GC from removing files
+    /// This function acquires a lock to prevent GC from removing files
     /// as we are opening our index.
     fn open_segment_readers(index: &Index) -> crate::Result<Vec<SegmentReader>> {
         // Prevents segment files from getting deleted while we are in the process of opening them
@@ -282,7 +281,7 @@ impl IndexReader {
     /// Update searchers so that they reflect the state of the last
     /// `.commit()`.
     ///
-    /// If you set up the [`ReloadPolicy::OnCommit`] (which is the default)
+    /// If you set up the [`ReloadPolicy::OnCommitWithDelay`] (which is the default)
     /// every commit should be rapidly reflected on your `IndexReader` and you should
     /// not need to call `reload()` at all.
     ///

@@ -3,7 +3,7 @@
 //! In "The beauty and the beast", the term "the" appears in position 0 and position 3.
 //! This information is useful to run phrase queries.
 //!
-//! The [position](crate::SegmentComponent::Positions) file contains all of the
+//! The [position](crate::index::SegmentComponent::Positions) file contains all of the
 //! bitpacked positions delta, for all terms of a given field, one term after the other.
 //!
 //! Each term is encoded independently.
@@ -119,7 +119,7 @@ pub mod tests {
         serializer.close_term()?;
         serializer.close()?;
         let position_delta = OwnedBytes::new(positions_buffer);
-        let mut output_delta_pos_buffer = vec![0u32; 5];
+        let mut output_delta_pos_buffer = [0u32; 5];
         let mut position_reader = PositionReader::open(position_delta)?;
         position_reader.read(0, &mut output_delta_pos_buffer[..]);
         assert_eq!(

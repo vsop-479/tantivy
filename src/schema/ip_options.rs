@@ -31,21 +31,25 @@ pub struct IpAddrOptions {
 
 impl IpAddrOptions {
     /// Returns true iff the value is a fast field.
+    #[inline]
     pub fn is_fast(&self) -> bool {
         self.fast
     }
 
     /// Returns `true` if the ip address should be stored in the doc store.
+    #[inline]
     pub fn is_stored(&self) -> bool {
         self.stored
     }
 
     /// Returns true iff the value is indexed and therefore searchable.
+    #[inline]
     pub fn is_indexed(&self) -> bool {
         self.indexed
     }
 
     /// Returns true if and only if the value is normed.
+    #[inline]
     pub fn fieldnorms(&self) -> bool {
         self.fieldnorms
     }
@@ -83,9 +87,6 @@ impl IpAddrOptions {
     /// Set the field as a fast field.
     ///
     /// Fast fields are designed for random access.
-    /// Access time are similar to a random lookup in an array.
-    /// If more than one value is associated with a fast field, only the last one is
-    /// kept.
     #[must_use]
     pub fn set_fast(mut self) -> Self {
         self.fast = true;

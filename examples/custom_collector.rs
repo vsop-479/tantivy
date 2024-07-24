@@ -11,9 +11,10 @@ use columnar::Column;
 // ---
 // Importing tantivy...
 use tantivy::collector::{Collector, SegmentCollector};
+use tantivy::index::SegmentReader;
 use tantivy::query::QueryParser;
 use tantivy::schema::{Schema, FAST, INDEXED, TEXT};
-use tantivy::{doc, Index, Score, SegmentReader};
+use tantivy::{doc, Index, IndexWriter, Score};
 
 #[derive(Default)]
 struct Stats {
@@ -142,7 +143,7 @@ fn main() -> tantivy::Result<()> {
     // this example.
     let index = Index::create_in_ram(schema);
 
-    let mut index_writer = index.writer(50_000_000)?;
+    let mut index_writer: IndexWriter = index.writer(50_000_000)?;
     index_writer.add_document(doc!(
         product_name => "Super Broom 2000",
         product_description => "While it is ok for short distance travel, this broom \

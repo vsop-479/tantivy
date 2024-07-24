@@ -1,16 +1,13 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
 use serde::de::{SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::{self, Value as JsonValue};
 
-use super::ip_options::IpAddrOptions;
 use super::*;
-use crate::schema::bytes_options::BytesOptions;
-use crate::schema::field_type::ValueParsingError;
+use crate::json_utils::split_json_path;
 use crate::TantivyError;
 
 /// Tantivy has a very strict schema.
@@ -32,7 +29,7 @@ use crate::TantivyError;
 /// let body_field = schema_builder.add_text_field("body", TEXT);
 /// let schema = schema_builder.build();
 /// ```
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct SchemaBuilder {
     fields: Vec<FieldEntry>,
     fields_map: HashMap<String, Field>,
@@ -280,6 +277,7 @@ fn locate_splitting_dots(field_path: &str) -> Vec<usize> {
 
 impl Schema {
     /// Return the `FieldEntry` associated with a `Field`.
+    #[inline]
     pub fn get_field_entry(&self, field: Field) -> &FieldEntry {
         &self.0.fields[field.field_id() as usize]
     }
@@ -317,78 +315,6 @@ impl Schema {
             .ok_or_else(|| TantivyError::FieldNotFound(field_name.to_string()))
     }
 
-    /// Create document from a named doc.
-    pub fn convert_named_doc(
-        &self,
-        named_doc: NamedFieldDocument,
-    ) -> Result<Document, DocParsingError> {
-        let mut document = Document::new();
-        for (field_name, values) in named_doc.0 {
-            if let Ok(field) = self.get_field(&field_name) {
-                for value in values {
-                    document.add_field_value(field, value);
-                }
-            }
-        }
-        Ok(document)
-    }
-
-    /// Create a named document from the doc.
-    pub fn to_named_doc(&self, doc: &Document) -> NamedFieldDocument {
-        let mut field_map = BTreeMap::new();
-        for (field, field_values) in doc.get_sorted_field_values() {
-            let field_name = self.get_field_name(field);
-            let values: Vec<Value> = field_values.into_iter().cloned().collect();
-            field_map.insert(field_name.to_string(), values);
-        }
-        NamedFieldDocument(field_map)
-    }
-
-    /// Encode the schema in JSON.
-    ///
-    /// Encoding a document cannot fail.
-    pub fn to_json(&self, doc: &Document) -> String {
-        serde_json::to_string(&self.to_named_doc(doc)).expect("doc encoding failed. This is a bug")
-    }
-
-    /// Build a document object from a json-object.
-    pub fn parse_document(&self, doc_json: &str) -> Result<Document, DocParsingError> {
-        let json_obj: serde_json::Map<String, JsonValue> =
-            serde_json::from_str(doc_json).map_err(|_| DocParsingError::invalid_json(doc_json))?;
-        self.json_object_to_doc(json_obj)
-    }
-
-    /// Build a document object from a json-object.
-    pub fn json_object_to_doc(
-        &self,
-        json_obj: serde_json::Map<String, JsonValue>,
-    ) -> Result<Document, DocParsingError> {
-        let mut doc = Document::default();
-        for (field_name, json_value) in json_obj {
-            if let Ok(field) = self.get_field(&field_name) {
-                let field_entry = self.get_field_entry(field);
-                let field_type = field_entry.field_type();
-                match json_value {
-                    JsonValue::Array(json_items) => {
-                        for json_item in json_items {
-                            let value = field_type
-                                .value_from_json(json_item)
-                                .map_err(|e| DocParsingError::ValueError(field_name.clone(), e))?;
-                            doc.add_field_value(field, value);
-                        }
-                    }
-                    _ => {
-                        let value = field_type
-                            .value_from_json(json_value)
-                            .map_err(|e| DocParsingError::ValueError(field_name.clone(), e))?;
-                        doc.add_field_value(field, value);
-                    }
-                }
-            }
-        }
-        Ok(doc)
-    }
-
     /// Searches for a full_path in the schema, returning the field name and a JSON path.
     ///
     /// This function works by checking if the field exists for the exact given full_path.
@@ -401,14 +327,46 @@ impl Schema {
         if let Some(field) = self.0.fields_map.get(full_path) {
             return Some((*field, ""));
         }
+
         let mut splitting_period_pos: Vec<usize> = locate_splitting_dots(full_path);
         while let Some(pos) = splitting_period_pos.pop() {
             let (prefix, suffix) = full_path.split_at(pos);
+
             if let Some(field) = self.0.fields_map.get(prefix) {
+                return Some((*field, &suffix[1..]));
+            }
+            // JSON path may contain a dot, for now we try both variants to find the field.
+            let prefix = split_json_path(prefix).join(".");
+            if let Some(field) = self.0.fields_map.get(&prefix) {
                 return Some((*field, &suffix[1..]));
             }
         }
         None
+    }
+
+    /// Transforms a user-supplied fast field name into a column name.
+    ///
+    /// This is similar to `.find_field` except it includes some fallback logic to
+    /// a default json field. This functionality is used in Quickwit.
+    ///
+    /// If the remaining path is empty and seems to target JSON field, we return None.
+    /// If the remaining path is non-empty and seems to target a non-JSON field, we return None.
+    #[doc(hidden)]
+    pub fn find_field_with_default<'a>(
+        &self,
+        full_path: &'a str,
+
+        default_field_opt: Option<Field>,
+    ) -> Option<(Field, &'a str)> {
+        let (field, json_path) = self
+            .find_field(full_path)
+            .or(default_field_opt.map(|field| (field, full_path)))?;
+        let field_entry = self.get_field_entry(field);
+        let is_json = field_entry.field_type().value_type() == Type::Json;
+        if is_json == json_path.is_empty() {
+            return None;
+        }
+        Some((field, json_path))
     }
 }
 
@@ -454,26 +412,6 @@ impl<'de> Deserialize<'de> for Schema {
     }
 }
 
-/// Error that may happen when deserializing
-/// a document from JSON.
-#[derive(Debug, Error, PartialEq)]
-pub enum DocParsingError {
-    /// The payload given is not valid JSON.
-    #[error("The provided string is not valid JSON")]
-    InvalidJson(String),
-    /// One of the value node could not be parsed.
-    #[error("The field '{0:?}' could not be parsed: {1:?}")]
-    ValueError(String, ValueParsingError),
-}
-
-impl DocParsingError {
-    /// Builds a NotJson DocParsingError
-    fn invalid_json(invalid_json: &str) -> Self {
-        let sample = invalid_json.chars().take(20).collect();
-        DocParsingError::InvalidJson(sample)
-    }
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -481,7 +419,6 @@ mod tests {
 
     use matches::{assert_matches, matches};
     use pretty_assertions::assert_eq;
-    use serde_json;
 
     use crate::schema::field_type::ValueParsingError;
     use crate::schema::schema::DocParsingError::InvalidJson;
@@ -490,8 +427,8 @@ mod tests {
     #[test]
     fn test_locate_splitting_dots() {
         assert_eq!(&super::locate_splitting_dots("a.b.c"), &[1, 3]);
-        assert_eq!(&super::locate_splitting_dots(r#"a\.b.c"#), &[4]);
-        assert_eq!(&super::locate_splitting_dots(r#"a\..b.c"#), &[3, 5]);
+        assert_eq!(&super::locate_splitting_dots(r"a\.b.c"), &[4]);
+        assert_eq!(&super::locate_splitting_dots(r"a\..b.c"), &[3, 5]);
     }
 
     #[test]
@@ -651,9 +588,9 @@ mod tests {
                 "ip": "127.0.0.1",
                 "is_read": true
         }"#;
-        let doc = schema.parse_document(doc_json).unwrap();
+        let doc = TantivyDocument::parse_json(&schema, doc_json).unwrap();
 
-        let doc_serdeser = schema.parse_document(&schema.to_json(&doc)).unwrap();
+        let doc_serdeser = TantivyDocument::parse_json(&schema, &doc.to_json(&schema)).unwrap();
         assert_eq!(doc, doc_serdeser);
     }
 
@@ -667,26 +604,26 @@ mod tests {
         let doc_json = r#"{
                 "ip": "127.0.0.1"
         }"#;
-        let doc = schema.parse_document(doc_json).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&schema.to_json(&doc)).unwrap();
+        let doc = TantivyDocument::parse_json(&schema, doc_json).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&doc.to_json(&schema)).unwrap();
         assert_eq!(value["ip"][0], "127.0.0.1");
 
         // Special case IpV6 loopback. We don't want to map that to IPv4
         let doc_json = r#"{
                 "ip": "::1"
         }"#;
-        let doc = schema.parse_document(doc_json).unwrap();
+        let doc = TantivyDocument::parse_json(&schema, doc_json).unwrap();
 
-        let value: serde_json::Value = serde_json::from_str(&schema.to_json(&doc)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&doc.to_json(&schema)).unwrap();
         assert_eq!(value["ip"][0], "::1");
 
         // testing ip address of every router in the world
         let doc_json = r#"{
                 "ip": "192.168.0.1"
         }"#;
-        let doc = schema.parse_document(doc_json).unwrap();
+        let doc = TantivyDocument::parse_json(&schema, doc_json).unwrap();
 
-        let value: serde_json::Value = serde_json::from_str(&schema.to_json(&doc)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&doc.to_json(&schema)).unwrap();
         assert_eq!(value["ip"][0], "192.168.0.1");
     }
 
@@ -699,25 +636,24 @@ mod tests {
         let mut named_doc_map = BTreeMap::default();
         named_doc_map.insert(
             "title".to_string(),
-            vec![Value::from("title1"), Value::from("title2")],
+            vec![OwnedValue::from("title1"), OwnedValue::from("title2")],
         );
         named_doc_map.insert(
             "val".to_string(),
-            vec![Value::from(14u64), Value::from(-1i64)],
+            vec![OwnedValue::from(14u64), OwnedValue::from(-1i64)],
         );
-        let doc = schema
-            .convert_named_doc(NamedFieldDocument(named_doc_map))
-            .unwrap();
+        let doc =
+            TantivyDocument::convert_named_doc(&schema, NamedFieldDocument(named_doc_map)).unwrap();
         assert_eq!(
-            doc.get_all(title).collect::<Vec<_>>(),
+            doc.get_all(title).map(OwnedValue::from).collect::<Vec<_>>(),
             vec![
-                &Value::from("title1".to_string()),
-                &Value::from("title2".to_string())
+                OwnedValue::from("title1".to_string()),
+                OwnedValue::from("title2".to_string())
             ]
         );
         assert_eq!(
-            doc.get_all(val).collect::<Vec<_>>(),
-            vec![&Value::from(14u64), &Value::from(-1i64)]
+            doc.get_all(val).map(OwnedValue::from).collect::<Vec<_>>(),
+            vec![OwnedValue::from(14u64), OwnedValue::from(-1i64)]
         );
     }
 
@@ -727,11 +663,9 @@ mod tests {
         let mut named_doc_map = BTreeMap::default();
         named_doc_map.insert(
             "title".to_string(),
-            vec![Value::from("title1"), Value::from("title2")],
+            vec![OwnedValue::from("title1"), OwnedValue::from("title2")],
         );
-        schema
-            .convert_named_doc(NamedFieldDocument(named_doc_map))
-            .unwrap();
+        TantivyDocument::convert_named_doc(&schema, NamedFieldDocument(named_doc_map)).unwrap();
     }
 
     #[test]
@@ -747,27 +681,27 @@ mod tests {
         let score_field = schema_builder.add_f64_field("score", score_options);
         let schema = schema_builder.build();
         {
-            let doc = schema.parse_document("{}").unwrap();
-            assert!(doc.field_values().is_empty());
+            let doc = TantivyDocument::parse_json(&schema, "{}").unwrap();
+            assert!(doc.field_values().next().is_none());
         }
         {
-            let doc = schema
-                .parse_document(
-                    r#"{
+            let doc = TantivyDocument::parse_json(
+                &schema,
+                r#"{
                 "title": "my title",
                 "author": "fulmicoton",
                 "count": 4,
                 "popularity": 10,
                 "score": 80.5
             }"#,
-                )
-                .unwrap();
+            )
+            .unwrap();
             assert_eq!(
-                doc.get_first(title_field).unwrap().as_text(),
+                doc.get_first(title_field).unwrap().as_str(),
                 Some("my title")
             );
             assert_eq!(
-                doc.get_first(author_field).unwrap().as_text(),
+                doc.get_first(author_field).unwrap().as_str(),
                 Some("fulmicoton")
             );
             assert_eq!(doc.get_first(count_field).unwrap().as_u64(), Some(4));
@@ -775,7 +709,8 @@ mod tests {
             assert_eq!(doc.get_first(score_field).unwrap().as_f64(), Some(80.5f64));
         }
         {
-            let res = schema.parse_document(
+            let res = TantivyDocument::parse_json(
+                &schema,
                 r#"{
                 "thisfieldisnotdefinedintheschema": "my title",
                 "title": "my title",
@@ -789,7 +724,8 @@ mod tests {
             assert!(res.is_ok());
         }
         {
-            let json_err = schema.parse_document(
+            let json_err = TantivyDocument::parse_json(
+                &schema,
                 r#"{
                 "title": "my title",
                 "author": "fulmicoton",
@@ -808,7 +744,8 @@ mod tests {
             );
         }
         {
-            let json_err = schema.parse_document(
+            let json_err = TantivyDocument::parse_json(
+                &schema,
                 r#"{
                 "title": "my title",
                 "author": "fulmicoton",
@@ -826,7 +763,8 @@ mod tests {
             );
         }
         {
-            let json_err = schema.parse_document(
+            let json_err = TantivyDocument::parse_json(
+                &schema,
                 r#"{
                 "title": "my title",
                 "author": "fulmicoton",
@@ -844,7 +782,8 @@ mod tests {
             ));
         }
         {
-            let json_err = schema.parse_document(
+            let json_err = TantivyDocument::parse_json(
+                &schema,
                 r#"{
                 "title": "my title",
                 "author": "fulmicoton",
@@ -863,11 +802,12 @@ mod tests {
         }
         {
             // Short JSON, under the 20 char take.
-            let json_err = schema.parse_document(r#"{"count": 50,}"#);
+            let json_err = TantivyDocument::parse_json(&schema, r#"{"count": 50,}"#);
             assert_matches!(json_err, Err(InvalidJson(_)));
         }
         {
-            let json_err = schema.parse_document(
+            let json_err = TantivyDocument::parse_json(
+                &schema,
                 r#"{
                 "title": "my title",
                 "author": "fulmicoton",

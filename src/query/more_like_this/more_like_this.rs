@@ -1,13 +1,14 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 
+use tokenizer_api::Token;
+
 use crate::query::bm25::idf;
 use crate::query::{BooleanQuery, BoostQuery, Occur, Query, TermQuery};
-use crate::schema::{Field, FieldType, IndexRecordOption, Term, Value};
-use crate::tokenizer::{
-    BoxTokenStream, FacetTokenizer, PreTokenizedStream, TokenStream, Tokenizer,
-};
-use crate::{DocAddress, Result, Searcher, TantivyError};
+use crate::schema::document::{Document, Value};
+use crate::schema::{Field, FieldType, IndexRecordOption, Term};
+use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TokenStream, Tokenizer};
+use crate::{DocAddress, Result, Searcher, TantivyDocument, TantivyError};
 
 #[derive(Debug, PartialEq)]
 struct ScoreTerm {
@@ -25,13 +26,15 @@ impl Eq for ScoreTerm {}
 
 impl PartialOrd for ScoreTerm {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.score.partial_cmp(&other.score)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for ScoreTerm {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+        self.score
+            .partial_cmp(&other.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
@@ -90,10 +93,10 @@ impl MoreLikeThis {
     }
 
     /// Creates a [`BooleanQuery`] using a set of field values.
-    pub fn query_with_document_fields(
+    pub fn query_with_document_fields<'a, V: Value<'a>>(
         &self,
         searcher: &Searcher,
-        doc_fields: &[(Field, Vec<Value>)],
+        doc_fields: &[(Field, Vec<V>)],
     ) -> Result<BooleanQuery> {
         let score_terms = self.retrieve_terms_from_doc_fields(searcher, doc_fields)?;
         let query = self.create_query(score_terms);
@@ -126,26 +129,18 @@ impl MoreLikeThis {
         searcher: &Searcher,
         doc_address: DocAddress,
     ) -> Result<Vec<ScoreTerm>> {
-        let doc = searcher.doc(doc_address)?;
-        let field_to_values = doc
-            .get_sorted_field_values()
-            .iter()
-            .map(|(field, values)| {
-                (
-                    *field,
-                    values.iter().map(|v| (**v).clone()).collect::<Vec<Value>>(),
-                )
-            })
-            .collect::<Vec<_>>();
+        let doc = searcher.doc::<TantivyDocument>(doc_address)?;
+
+        let field_to_values = doc.get_sorted_field_values();
         self.retrieve_terms_from_doc_fields(searcher, &field_to_values)
     }
 
     /// Finds terms for a more-like-this query.
     /// field_to_field_values is a mapping from field to possible values of that field.
-    fn retrieve_terms_from_doc_fields(
+    fn retrieve_terms_from_doc_fields<'a, V: Value<'a>>(
         &self,
         searcher: &Searcher,
-        field_to_values: &[(Field, Vec<Value>)],
+        field_to_values: &[(Field, Vec<V>)],
     ) -> Result<Vec<ScoreTerm>> {
         if field_to_values.is_empty() {
             return Err(TantivyError::InvalidArgument(
@@ -164,11 +159,11 @@ impl MoreLikeThis {
     /// Computes the frequency of values for a field while updating the term frequencies
     /// Note: A FieldValue can be made up of multiple terms.
     /// We are interested in extracting terms within FieldValue
-    fn add_term_frequencies(
+    fn add_term_frequencies<'a, V: Value<'a>>(
         &self,
         searcher: &Searcher,
         field: Field,
-        values: &[Value],
+        values: &[V],
         term_frequencies: &mut HashMap<Term, usize>,
     ) -> Result<()> {
         let schema = searcher.schema();
@@ -184,52 +179,50 @@ impl MoreLikeThis {
             FieldType::Facet(_) => {
                 let facets: Vec<&str> = values
                     .iter()
-                    .map(|value| match value {
-                        Value::Facet(ref facet) => Ok(facet.encoded_str()),
-                        _ => Err(TantivyError::InvalidArgument(
-                            "invalid field value".to_string(),
-                        )),
+                    .map(|value| {
+                        value.as_facet().ok_or_else(|| {
+                            TantivyError::InvalidArgument("invalid field value".to_string())
+                        })
                     })
                     .collect::<Result<Vec<_>>>()?;
                 for fake_str in facets {
-                    FacetTokenizer.token_stream(fake_str).process(&mut |token| {
-                        if self.is_noise_word(token.text.clone()) {
-                            let term = Term::from_field_text(field, &token.text);
-                            *term_frequencies.entry(term).or_insert(0) += 1;
-                        }
-                    });
+                    FacetTokenizer::default()
+                        .token_stream(fake_str)
+                        .process(&mut |token| {
+                            if self.is_noise_word(token.text.clone()) {
+                                let term = Term::from_field_text(field, &token.text);
+                                *term_frequencies.entry(term).or_insert(0) += 1;
+                            }
+                        });
                 }
             }
             FieldType::Str(text_options) => {
-                let mut token_streams: Vec<BoxTokenStream> = vec![];
+                let mut tokenizer_opt = text_options
+                    .get_indexing_options()
+                    .map(|options| options.tokenizer())
+                    .and_then(|tokenizer_name| tokenizer_manager.get(tokenizer_name));
 
-                for value in values {
-                    match value {
-                        Value::PreTokStr(tok_str) => {
-                            token_streams.push(PreTokenizedStream::from(tok_str.clone()).into());
-                        }
-                        Value::Str(ref text) => {
-                            if let Some(tokenizer) = text_options
-                                .get_indexing_options()
-                                .map(|text_indexing_options| {
-                                    text_indexing_options.tokenizer().to_string()
-                                })
-                                .and_then(|tokenizer_name| tokenizer_manager.get(&tokenizer_name))
-                            {
-                                token_streams.push(tokenizer.token_stream(text));
-                            }
-                        }
-                        _ => (),
+                let sink = &mut |token: &Token| {
+                    if !self.is_noise_word(token.text.clone()) {
+                        let term = Term::from_field_text(field, &token.text);
+                        *term_frequencies.entry(term).or_insert(0) += 1;
                     }
-                }
+                };
 
-                for mut token_stream in token_streams {
-                    token_stream.process(&mut |token| {
-                        if !self.is_noise_word(token.text.clone()) {
-                            let term = Term::from_field_text(field, &token.text);
-                            *term_frequencies.entry(term).or_insert(0) += 1;
-                        }
-                    });
+                // TOOD: Validate these changed align with the HEAD branch.
+                for value in values {
+                    if let Some(text) = value.as_str() {
+                        let tokenizer = match &mut tokenizer_opt {
+                            None => continue,
+                            Some(tokenizer) => tokenizer,
+                        };
+
+                        let mut token_stream = tokenizer.token_stream(text);
+                        token_stream.process(sink);
+                    } else if let Some(tok_str) = value.as_pre_tokenized_text() {
+                        let mut token_stream = PreTokenizedStream::from(*tok_str.clone());
+                        token_stream.process(sink);
+                    }
                 }
             }
             FieldType::U64(_) => {
@@ -245,14 +238,11 @@ impl MoreLikeThis {
             }
             FieldType::Date(_) => {
                 for value in values {
-                    let timestamp_micros = value
-                        .as_date()
-                        .ok_or_else(|| TantivyError::InvalidArgument("invalid value".to_string()))?
-                        .into_timestamp_micros();
-                    if !self.is_noise_word(timestamp_micros.to_string()) {
-                        let term = Term::from_field_i64(field, timestamp_micros);
-                        *term_frequencies.entry(term).or_insert(0) += 1;
-                    }
+                    let timestamp = value.as_datetime().ok_or_else(|| {
+                        TantivyError::InvalidArgument("invalid value".to_string())
+                    })?;
+                    let term = Term::from_field_date(field, timestamp);
+                    *term_frequencies.entry(term).or_insert(0) += 1;
                 }
             }
             FieldType::I64(_) => {

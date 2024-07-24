@@ -87,9 +87,8 @@ impl FastFieldReaders {
     ) -> crate::Result<Option<String>> {
         let Some((field, path)): Option<(Field, &str)> = self
             .schema
-            .find_field(field_name)
-            .or_else(|| default_field_opt.map(|default_field| (default_field, field_name)))
-        else{
+            .find_field_with_default(field_name, default_field_opt)
+        else {
             return Ok(None);
         };
         let field_entry: &FieldEntry = self.schema.get_field_entry(field);
@@ -98,22 +97,17 @@ impl FastFieldReaders {
                 "Field {field_name:?} is not configured as fast field"
             )));
         }
-        let field_name = self.schema.get_field_name(field);
-        if path.is_empty() {
-            return Ok(Some(field_name.to_string()));
-        }
-        let field_type = field_entry.field_type();
-        match (field_type, path) {
+        Ok(match (field_entry.field_type(), path) {
             (FieldType::JsonObject(json_options), path) if !path.is_empty() => {
-                Ok(Some(encode_column_name(
+                Some(encode_column_name(
                     field_entry.name(),
                     path,
                     json_options.is_expand_dots_enabled(),
-                )))
+                ))
             }
-            (_, "") => Ok(Some(field_entry.name().to_string())),
-            _ => Ok(None),
-        }
+            (_, "") => Some(field_entry.name().to_string()),
+            _ => None,
+        })
     }
 
     /// Returns a typed column associated to a given field name.
@@ -126,7 +120,8 @@ impl FastFieldReaders {
         T: HasAssociatedColumnType,
         DynamicColumn: Into<Option<Column<T>>>,
     {
-        let Some(dynamic_column_handle) = self.dynamic_column_handle(field_name, T::column_type())?
+        let Some(dynamic_column_handle) =
+            self.dynamic_column_handle(field_name, T::column_type())?
         else {
             return Ok(None);
         };
@@ -202,7 +197,8 @@ impl FastFieldReaders {
 
     /// Returns a `str` column.
     pub fn str(&self, field_name: &str) -> crate::Result<Option<StrColumn>> {
-        let Some(dynamic_column_handle) = self.dynamic_column_handle(field_name, ColumnType::Str)?
+        let Some(dynamic_column_handle) =
+            self.dynamic_column_handle(field_name, ColumnType::Str)?
         else {
             return Ok(None);
         };
@@ -212,7 +208,8 @@ impl FastFieldReaders {
 
     /// Returns a `bytes` column.
     pub fn bytes(&self, field_name: &str) -> crate::Result<Option<BytesColumn>> {
-        let Some(dynamic_column_handle) = self.dynamic_column_handle(field_name, ColumnType::Bytes)?
+        let Some(dynamic_column_handle) =
+            self.dynamic_column_handle(field_name, ColumnType::Bytes)?
         else {
             return Ok(None);
         };
@@ -237,6 +234,22 @@ impl FastFieldReaders {
         Ok(dynamic_column_handle_opt)
     }
 
+    /// Returning all `dynamic_column_handle`.
+    pub fn dynamic_column_handles(
+        &self,
+        field_name: &str,
+    ) -> crate::Result<Vec<DynamicColumnHandle>> {
+        let Some(resolved_field_name) = self.resolve_field(field_name)? else {
+            return Ok(Vec::new());
+        };
+        let dynamic_column_handles = self
+            .columnar
+            .read_columns(&resolved_field_name)?
+            .into_iter()
+            .collect();
+        Ok(dynamic_column_handles)
+    }
+
     #[doc(hidden)]
     pub async fn list_dynamic_column_handles(
         &self,
@@ -252,31 +265,69 @@ impl FastFieldReaders {
         Ok(columns)
     }
 
-    /// Returns the `u64` column used to represent any `u64`-mapped typed (i64, u64, f64, DateTime).
-    #[doc(hidden)]
-    pub fn u64_lenient(&self, field_name: &str) -> crate::Result<Option<Column<u64>>> {
-        Ok(self
-            .u64_lenient_with_type(field_name)?
-            .map(|(u64_column, _)| u64_column))
-    }
-
-    /// Returns the `u64` column used to represent any `u64`-mapped typed (i64, u64, f64, DateTime).
+    /// Returns the `u64` column used to represent any `u64`-mapped typed (String/Bytes term ids,
+    /// i64, u64, f64, DateTime).
     ///
     /// Returns Ok(None) for empty columns
     #[doc(hidden)]
-    pub fn u64_lenient_with_type(
+    pub fn u64_lenient_for_type(
         &self,
+        type_white_list_opt: Option<&[ColumnType]>,
         field_name: &str,
     ) -> crate::Result<Option<(Column<u64>, ColumnType)>> {
         let Some(resolved_field_name) = self.resolve_field(field_name)? else {
             return Ok(None);
         };
         for col in self.columnar.read_columns(&resolved_field_name)? {
+            if let Some(type_white_list) = type_white_list_opt {
+                if !type_white_list.contains(&col.column_type()) {
+                    continue;
+                }
+            }
             if let Some(col_u64) = col.open_u64_lenient()? {
                 return Ok(Some((col_u64, col.column_type())));
             }
         }
         Ok(None)
+    }
+
+    /// Returns the all `u64` column used to represent any `u64`-mapped typed (String/Bytes term
+    /// ids, i64, u64, f64, bool, DateTime).
+    ///
+    /// In case of JSON, there may be two columns. One for term and one for numerical types. (This
+    /// may change later to 3 types if JSON handles DateTime)
+    #[doc(hidden)]
+    pub fn u64_lenient_for_type_all(
+        &self,
+        type_white_list_opt: Option<&[ColumnType]>,
+        field_name: &str,
+    ) -> crate::Result<Vec<(Column<u64>, ColumnType)>> {
+        let mut columns_and_types = Vec::new();
+        let Some(resolved_field_name) = self.resolve_field(field_name)? else {
+            return Ok(columns_and_types);
+        };
+        for col in self.columnar.read_columns(&resolved_field_name)? {
+            if let Some(type_white_list) = type_white_list_opt {
+                if !type_white_list.contains(&col.column_type()) {
+                    continue;
+                }
+            }
+            if let Some(col_u64) = col.open_u64_lenient()? {
+                columns_and_types.push((col_u64, col.column_type()));
+            }
+        }
+        Ok(columns_and_types)
+    }
+
+    /// Returns the `u64` column used to represent any `u64`-mapped typed (i64, u64, f64, DateTime).
+    ///
+    /// Returns Ok(None) for empty columns
+    #[doc(hidden)]
+    pub fn u64_lenient(
+        &self,
+        field_name: &str,
+    ) -> crate::Result<Option<(Column<u64>, ColumnType)>> {
+        self.u64_lenient_for_type(None, field_name)
     }
 
     /// Returns the `i64` fast field reader reader associated with `field`.
@@ -303,8 +354,10 @@ impl FastFieldReaders {
 
 #[cfg(test)]
 mod tests {
+    use columnar::ColumnType;
+
     use crate::schema::{JsonObjectOptions, Schema, FAST};
-    use crate::{Document, Index};
+    use crate::{Index, IndexWriter, TantivyDocument};
 
     #[test]
     fn test_fast_field_reader_resolve_with_dynamic_internal() {
@@ -314,14 +367,16 @@ mod tests {
         schema_builder.add_json_field(
             "json_expand_dots_enabled",
             JsonObjectOptions::default()
-                .set_fast()
+                .set_fast(None)
                 .set_expand_dots_enabled(),
         );
         let dynamic_field = schema_builder.add_json_field("_dyna", FAST);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
-        let mut index_writer = index.writer_for_tests().unwrap();
-        index_writer.add_document(Document::default()).unwrap();
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+        index_writer
+            .add_document(TantivyDocument::default())
+            .unwrap();
         index_writer.commit().unwrap();
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
@@ -381,5 +436,46 @@ mod tests {
                 .unwrap(),
             Some("_dyna\u{1}notinschema\u{1}attr\u{1}color".to_string())
         );
+    }
+
+    #[test]
+    fn test_fast_field_reader_dynamic_column_handles() {
+        let mut schema_builder = Schema::builder();
+        let id = schema_builder.add_u64_field("id", FAST);
+        let json = schema_builder.add_json_field("json", FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+        index_writer
+            .add_document(doc!(id=> 1u64, json => json!({"foo": 42})))
+            .unwrap();
+        index_writer
+            .add_document(doc!(id=> 2u64, json => json!({"foo": true})))
+            .unwrap();
+        index_writer
+            .add_document(doc!(id=> 3u64, json => json!({"foo": "bar"})))
+            .unwrap();
+        index_writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let reader = searcher.segment_reader(0u32);
+        let fast_fields = reader.fast_fields();
+        let id_columns = fast_fields.dynamic_column_handles("id").unwrap();
+        assert_eq!(id_columns.len(), 1);
+        assert_eq!(id_columns.first().unwrap().column_type(), ColumnType::U64);
+
+        let foo_columns = fast_fields.dynamic_column_handles("json.foo").unwrap();
+        assert_eq!(foo_columns.len(), 3);
+        assert!(foo_columns
+            .iter()
+            .any(|column| column.column_type() == ColumnType::I64));
+        assert!(foo_columns
+            .iter()
+            .any(|column| column.column_type() == ColumnType::Bool));
+        assert!(foo_columns
+            .iter()
+            .any(|column| column.column_type() == ColumnType::Str));
+
+        println!("*** {:?}", fast_fields.columnar().list_columns());
     }
 }

@@ -17,7 +17,7 @@ mod serializer;
 mod skip;
 mod term_info;
 
-pub(crate) use stacker::compute_table_size;
+pub(crate) use stacker::compute_table_memory_size;
 
 pub use self::block_segment_postings::BlockSegmentPostings;
 pub(crate) use self::indexing_context::IndexingContext;
@@ -42,9 +42,9 @@ pub mod tests {
     use std::mem;
 
     use super::{InvertedIndexSerializer, Postings};
-    use crate::core::{Index, SegmentComponent, SegmentReader};
     use crate::docset::{DocSet, TERMINATED};
     use crate::fieldnorm::FieldNormReader;
+    use crate::index::{Index, SegmentComponent, SegmentReader};
     use crate::indexer::operation::AddOperation;
     use crate::indexer::SegmentWriter;
     use crate::query::Scorer;
@@ -52,7 +52,7 @@ pub mod tests {
         Field, IndexRecordOption, Schema, Term, TextFieldIndexing, TextOptions, INDEXED, TEXT,
     };
     use crate::tokenizer::{SimpleTokenizer, MAX_TOKEN_LEN};
-    use crate::{DocId, HasLen, Score};
+    use crate::{DocId, HasLen, IndexWriter, Score};
 
     #[test]
     pub fn test_position_write() -> crate::Result<()> {
@@ -63,7 +63,7 @@ pub mod tests {
         let mut segment = index.new_segment();
         let mut posting_serializer = InvertedIndexSerializer::open(&mut segment)?;
         let mut field_serializer = posting_serializer.new_field(text_field, 120 * 4, None)?;
-        field_serializer.new_term("abc".as_bytes(), 12u32)?;
+        field_serializer.new_term("abc".as_bytes(), 12u32, true)?;
         for doc_id in 0u32..120u32 {
             let delta_positions = vec![1, 2, 3, 2];
             field_serializer.write_doc(doc_id, 4, &delta_positions);
@@ -162,7 +162,7 @@ pub mod tests {
         let index = Index::create_in_ram(schema);
         index
             .tokenizers()
-            .register("simple_no_truncation", SimpleTokenizer);
+            .register("simple_no_truncation", SimpleTokenizer::default());
         let reader = index.reader()?;
         let mut index_writer = index.writer_for_tests()?;
 
@@ -194,7 +194,7 @@ pub mod tests {
         let index = Index::create_in_ram(schema);
         index
             .tokenizers()
-            .register("simple_no_truncation", SimpleTokenizer);
+            .register("simple_no_truncation", SimpleTokenizer::default());
         let reader = index.reader()?;
         let mut index_writer = index.writer_for_tests()?;
 
@@ -225,7 +225,7 @@ pub mod tests {
 
         {
             let mut segment_writer =
-                SegmentWriter::for_segment(3_000_000, segment.clone()).unwrap();
+                SegmentWriter::for_segment(15_000_000, segment.clone()).unwrap();
             {
                 // checking that position works if the field has two values
                 let op = AddOperation {
@@ -432,7 +432,7 @@ pub mod tests {
 
         // delete some of the documents
         {
-            let mut index_writer = index.writer_for_tests()?;
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
             index_writer.delete_term(term_0);
             assert!(index_writer.commit().is_ok());
         }
@@ -483,7 +483,7 @@ pub mod tests {
 
         // delete everything else
         {
-            let mut index_writer = index.writer_for_tests()?;
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
             index_writer.delete_term(term_1);
             assert!(index_writer.commit().is_ok());
         }
@@ -544,8 +544,7 @@ pub mod tests {
             let skip_result_unopt = postings_unopt.seek(target);
             assert_eq!(
                 skip_result_unopt, skip_result_opt,
-                "Failed while skipping to {}",
-                target
+                "Failed while skipping to {target}"
             );
             assert!(skip_result_opt >= target);
             assert_eq!(skip_result_opt, postings_opt.doc());
@@ -569,8 +568,8 @@ mod bench {
 
     use crate::docset::TERMINATED;
     use crate::query::Intersection;
-    use crate::schema::{Document, Field, IndexRecordOption, Schema, Term, STRING};
-    use crate::{tests, DocSet, Index};
+    use crate::schema::{Field, IndexRecordOption, Schema, TantivyDocument, Term, STRING};
+    use crate::{tests, DocSet, Index, IndexWriter};
 
     pub static TERM_A: Lazy<Term> = Lazy::new(|| {
         let field = Field::from_field_id(0);
@@ -599,9 +598,9 @@ mod bench {
         let index = Index::create_in_ram(schema);
         let posting_list_size = 1_000_000;
         {
-            let mut index_writer = index.writer_for_tests().unwrap();
+            let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
             for _ in 0..posting_list_size {
-                let mut doc = Document::default();
+                let mut doc = TantivyDocument::default();
                 if rng.gen_bool(1f64 / 15f64) {
                     doc.add_text(text_field, "a");
                 }

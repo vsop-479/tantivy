@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::mem;
 
-use rust_stemmers::{self, Algorithm};
+use rust_stemmers::Algorithm;
 use serde::{Deserialize, Serialize};
 
 use super::{Token, TokenFilter, TokenStream, Tokenizer};
@@ -100,7 +100,7 @@ pub struct StemmerFilter<T> {
 impl<T: Tokenizer> Tokenizer for StemmerFilter<T> {
     type TokenStream<'a> = StemmerTokenStream<T::TokenStream<'a>>;
 
-    fn token_stream<'a>(&self, text: &'a str) -> Self::TokenStream<'a> {
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
         let stemmer = rust_stemmers::Stemmer::create(self.stemmer_algorithm);
         StemmerTokenStream {
             tail: self.inner.token_stream(text),

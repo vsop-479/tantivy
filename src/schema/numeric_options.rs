@@ -5,10 +5,6 @@ use serde::{Deserialize, Serialize};
 use super::flags::CoerceFlag;
 use crate::schema::flags::{FastFlag, IndexedFlag, SchemaFlagList, StoredFlag};
 
-#[deprecated(since = "0.17.0", note = "Use NumericOptions instead.")]
-/// Deprecated use [`NumericOptions`] instead.
-pub type IntOptions = NumericOptions;
-
 /// Define how an `u64`, `i64`, or `f64` field should be handled by tantivy.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(from = "NumericOptionsDeser")]
@@ -57,26 +53,31 @@ impl From<NumericOptionsDeser> for NumericOptions {
 
 impl NumericOptions {
     /// Returns true iff the value is stored in the doc store.
+    #[inline]
     pub fn is_stored(&self) -> bool {
         self.stored
     }
 
     /// Returns true iff the value is indexed and therefore searchable.
+    #[inline]
     pub fn is_indexed(&self) -> bool {
         self.indexed
     }
 
     /// Returns true iff the field has fieldnorm.
+    #[inline]
     pub fn fieldnorms(&self) -> bool {
         self.fieldnorms && self.indexed
     }
 
     /// Returns true iff the value is a fast field.
+    #[inline]
     pub fn is_fast(&self) -> bool {
         self.fast
     }
 
     /// Returns true if values should be coerced to numbers.
+    #[inline]
     pub fn should_coerce(&self) -> bool {
         self.coerce
     }
@@ -120,12 +121,9 @@ impl NumericOptions {
         self
     }
 
-    /// Set the field as a single-valued fast field.
+    /// Set the field as a fast field.
     ///
     /// Fast fields are designed for random access.
-    /// Access time are similar to a random lookup in an array.
-    /// If more than one value is associated with a fast field, only the last one is
-    /// kept.
     #[must_use]
     pub fn set_fast(mut self) -> NumericOptions {
         self.fast = true;

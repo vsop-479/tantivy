@@ -1,10 +1,34 @@
 [package]
 name = "tantivy-stacker"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
+homepage = "https://github.com/quickwit-oss/tantivy"
+repository = "https://github.com/quickwit-oss/tantivy"
+description = "term hashmap used for indexing"
 
 [dependencies]
 murmurhash32 = "0.3"
-byteorder = "1"
-common = { version = "0.5", path = "../common/", package = "tantivy-common" }
+common = { version = "0.7", path = "../common/", package = "tantivy-common" }
+ahash = { version = "0.8.11", default-features = false, optional = true }
+rand_distr = "0.4.3"
+
+[[bench]]
+harness = false
+name = "crit_bench"
+path = "benches/crit_bench.rs"
+
+[[example]]
+name = "hashmap"
+path = "example/hashmap.rs"
+
+[dev-dependencies]
+rand = "0.8.5"
+zipf = "7.0.0"
+criterion = { git = "https://github.com/PSeitz/criterion.rs/", rev = "e6f98ee"} # This fork includes stack randomization to reduce caching effects
+rustc-hash = "1.1.0"
+proptest = "1.2.0"
+
+[features]
+compare_hash_only = ["ahash"] # Compare hash only, not the key in the Hashmap
+unstable = [] # useful for benches.

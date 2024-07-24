@@ -1,3 +1,59 @@
+//! [`SnippetGenerator`]
+//! Generates a text snippet for a given document, and some highlighted parts inside it.
+//! Imagine you doing a text search in a document
+//! and want to show a preview of where in the document the search terms occur,
+//! along with some surrounding text to give context, and the search terms highlighted.
+//!
+//! [`SnippetGenerator`] serves this purpose.
+//! It scans a document and constructs a snippet, which consists of sections where the search terms
+//! have been found, stitched together with "..." in between sections if necessary.
+//!
+//! ## Example
+//!
+//! ```rust
+//! # use tantivy::query::QueryParser;
+//! # use tantivy::schema::{Schema, TEXT};
+//! # use tantivy::{doc, Index};
+//! use tantivy::snippet::SnippetGenerator;
+//!
+//! # fn main() -> tantivy::Result<()> {
+//! #    let mut schema_builder = Schema::builder();
+//! #    let text_field = schema_builder.add_text_field("text", TEXT);
+//! #    let schema = schema_builder.build();
+//! #    let index = Index::create_in_ram(schema);
+//! #    let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+//! #    let doc = doc!(text_field => r#"Comme je descendais des Fleuves impassibles,
+//! #   Je ne me sentis plus guidé par les haleurs :
+//! #  Des Peaux-Rouges criards les avaient pris pour cibles,
+//! #  Les ayant cloués nus aux poteaux de couleurs.
+//! #
+//! #  J'étais insoucieux de tous les équipages,
+//! #  Porteur de blés flamands ou de cotons anglais.
+//! #  Quand avec mes haleurs ont fini ces tapages,
+//! #  Les Fleuves m'ont laissé descendre où je voulais.
+//! #  "#);
+//! #    index_writer.add_document(doc.clone())?;
+//! #    index_writer.commit()?;
+//! #    let query_parser = QueryParser::for_index(&index, vec![text_field]);
+//! // ...
+//! let query = query_parser.parse_query("haleurs flamands").unwrap();
+//! # let reader = index.reader()?;
+//! # let searcher = reader.searcher();
+//! let mut snippet_generator = SnippetGenerator::create(&searcher, &*query, text_field)?;
+//! snippet_generator.set_max_num_chars(100);
+//! let snippet = snippet_generator.snippet_from_doc(&doc);
+//! let snippet_html: String = snippet.to_html();
+//! assert_eq!(snippet_html, "Comme je descendais des Fleuves impassibles,\n  Je ne me sentis plus guidé par les <b>haleurs</b> :\n Des");
+//! #    Ok(())
+//! # }
+//! ```
+//!
+//! You can also specify the maximum number of characters for the snippets generated with the
+//! `set_max_num_chars` method. By default, this limit is set to 150.
+//!
+//! SnippetGenerator needs to be created from the `Searcher` and the query, and the field on which
+//! the `SnippetGenerator` should generate the snippets.
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -5,14 +61,18 @@ use std::ops::Range;
 use htmlescape::encode_minimal;
 
 use crate::query::Query;
-use crate::schema::{Field, Value};
+use crate::schema::document::{Document, Value};
+use crate::schema::Field;
 use crate::tokenizer::{TextAnalyzer, Token};
-use crate::{Document, Score, Searcher, Term};
+use crate::{Score, Searcher, Term};
 
 const DEFAULT_MAX_NUM_CHARS: usize = 150;
 
+const DEFAULT_SNIPPET_PREFIX: &str = "<b>";
+const DEFAULT_SNIPPET_POSTFIX: &str = "</b>";
+
 #[derive(Debug)]
-pub struct FragmentCandidate {
+pub(crate) struct FragmentCandidate {
     score: Score,
     start_offset: usize,
     stop_offset: usize,
@@ -55,17 +115,28 @@ impl FragmentCandidate {
 pub struct Snippet {
     fragment: String,
     highlighted: Vec<Range<usize>>,
+    snippet_prefix: String,
+    snippet_postfix: String,
 }
 
-const HIGHLIGHTEN_PREFIX: &str = "<b>";
-const HIGHLIGHTEN_POSTFIX: &str = "</b>";
-
 impl Snippet {
-    /// Create a new, empty, `Snippet`
+    /// Create a new `Snippet`.
+    fn new(fragment: &str, highlighted: Vec<Range<usize>>) -> Self {
+        Self {
+            fragment: fragment.to_string(),
+            highlighted,
+            snippet_prefix: DEFAULT_SNIPPET_PREFIX.to_string(),
+            snippet_postfix: DEFAULT_SNIPPET_POSTFIX.to_string(),
+        }
+    }
+
+    /// Create a new, empty, `Snippet`.
     pub fn empty() -> Snippet {
         Snippet {
             fragment: String::new(),
             highlighted: Vec::new(),
+            snippet_prefix: String::new(),
+            snippet_postfix: String::new(),
         }
     }
 
@@ -81,9 +152,9 @@ impl Snippet {
 
         for item in collapse_overlapped_ranges(&self.highlighted) {
             html.push_str(&encode_minimal(&self.fragment[start_from..item.start]));
-            html.push_str(HIGHLIGHTEN_PREFIX);
+            html.push_str(&self.snippet_prefix);
             html.push_str(&encode_minimal(&self.fragment[item.clone()]));
-            html.push_str(HIGHLIGHTEN_POSTFIX);
+            html.push_str(&self.snippet_postfix);
             start_from = item.end;
         }
         html.push_str(&encode_minimal(
@@ -100,6 +171,12 @@ impl Snippet {
     /// Returns a list of highlighted positions from the `Snippet`.
     pub fn highlighted(&self) -> &[Range<usize>] {
         &self.highlighted
+    }
+
+    /// Sets highlighted prefix and postfix.
+    pub fn set_snippet_prefix_postfix(&mut self, prefix: &str, postfix: &str) {
+        self.snippet_prefix = prefix.to_string();
+        self.snippet_postfix = postfix.to_string()
     }
 }
 
@@ -125,7 +202,7 @@ impl Snippet {
 /// Fragments must be valid in the sense that `&text[fragment.start..fragment.stop]`\
 /// has to be a valid string.
 fn search_fragments(
-    tokenizer: &TextAnalyzer,
+    tokenizer: &mut TextAnalyzer,
     text: &str,
     terms: &BTreeMap<String, Score>,
     max_num_chars: usize,
@@ -172,17 +249,11 @@ fn select_best_fragment_combination(fragments: &[FragmentCandidate], text: &str)
             .iter()
             .map(|item| item.start - fragment.start_offset..item.end - fragment.start_offset)
             .collect();
-        Snippet {
-            fragment: fragment_text.to_string(),
-            highlighted,
-        }
+        Snippet::new(fragment_text, highlighted)
     } else {
-        // when there no fragments to chose from,
-        // for now create a empty snippet
-        Snippet {
-            fragment: String::new(),
-            highlighted: vec![],
-        }
+        // When there are no fragments to chose from,
+        // for now create an empty snippet.
+        Snippet::empty()
     }
 }
 
@@ -241,14 +312,14 @@ fn is_sorted(mut it: impl Iterator<Item = usize>) -> bool {
 /// # use tantivy::query::QueryParser;
 /// # use tantivy::schema::{Schema, TEXT};
 /// # use tantivy::{doc, Index};
-/// use tantivy::SnippetGenerator;
+/// use tantivy::snippet::SnippetGenerator;
 ///
 /// # fn main() -> tantivy::Result<()> {
 /// #    let mut schema_builder = Schema::builder();
 /// #    let text_field = schema_builder.add_text_field("text", TEXT);
 /// #    let schema = schema_builder.build();
 /// #    let index = Index::create_in_ram(schema);
-/// #    let mut index_writer = index.writer_with_num_threads(1, 10_000_000)?;
+/// #    let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
 /// #    let doc = doc!(text_field => r#"Comme je descendais des Fleuves impassibles,
 /// #   Je ne me sentis plus guidé par les haleurs :
 /// #  Des Peaux-Rouges criards les avaient pris pour cibles,
@@ -310,7 +381,8 @@ impl SnippetGenerator {
         });
         let mut terms_text: BTreeMap<String, Score> = Default::default();
         for term in terms {
-            let term_str = if let Some(term_str) = term.as_str() {
+            let term_value = term.value();
+            let term_str = if let Some(term_str) = term_value.as_str() {
                 term_str
             } else {
                 continue;
@@ -330,7 +402,7 @@ impl SnippetGenerator {
         })
     }
 
-    /// Sets a maximum number of chars.
+    /// Sets a maximum number of chars. Default is 150.
     pub fn set_max_num_chars(&mut self, max_num_chars: usize) {
         self.max_num_chars = max_num_chars;
     }
@@ -344,19 +416,31 @@ impl SnippetGenerator {
     ///
     /// This method extract the text associated with the `SnippetGenerator`'s field
     /// and computes a snippet.
-    pub fn snippet_from_doc(&self, doc: &Document) -> Snippet {
-        let text: String = doc
-            .get_all(self.field)
-            .flat_map(Value::as_text)
-            .collect::<Vec<&str>>()
-            .join(" ");
-        self.snippet(&text)
+    pub fn snippet_from_doc<D: Document>(&self, doc: &D) -> Snippet {
+        let mut text = String::new();
+        for (field, value) in doc.iter_fields_and_values() {
+            let value = value as D::Value<'_>;
+            if field != self.field {
+                continue;
+            }
+
+            if let Some(val) = value.as_str() {
+                text.push(' ');
+                text.push_str(val);
+            }
+        }
+
+        self.snippet(text.trim())
     }
 
     /// Generates a snippet for the given text.
     pub fn snippet(&self, text: &str) -> Snippet {
-        let fragment_candidates =
-            search_fragments(&self.tokenizer, text, &self.terms_text, self.max_num_chars);
+        let fragment_candidates = search_fragments(
+            &mut self.tokenizer.clone(),
+            text,
+            &self.terms_text,
+            self.max_num_chars,
+        );
         select_best_fragment_combination(&fragment_candidates[..], text)
     }
 }
@@ -370,8 +454,9 @@ mod tests {
     use super::{collapse_overlapped_ranges, search_fragments, select_best_fragment_combination};
     use crate::query::QueryParser;
     use crate::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, TEXT};
+    use crate::snippet::SnippetGenerator;
     use crate::tokenizer::{NgramTokenizer, SimpleTokenizer};
-    use crate::{Index, SnippetGenerator};
+    use crate::Index;
 
     const TEST_TEXT: &str = r#"Rust is a systems programming language sponsored by
 Mozilla which describes it as a "safe, concurrent, practical language", supporting functional and
@@ -393,7 +478,12 @@ Survey in 2016, 2017, and 2018."#;
             String::from("rust") => 1.0,
             String::from("language") => 0.9
         };
-        let fragments = search_fragments(&From::from(SimpleTokenizer), TEST_TEXT, &terms, 100);
+        let fragments = search_fragments(
+            &mut From::from(SimpleTokenizer::default()),
+            TEST_TEXT,
+            &terms,
+            100,
+        );
         assert_eq!(fragments.len(), 7);
         {
             let first = &fragments[0];
@@ -420,7 +510,12 @@ Survey in 2016, 2017, and 2018."#;
                 String::from("rust") =>1.0,
                 String::from("language") => 0.9
             };
-            let fragments = search_fragments(&From::from(SimpleTokenizer), TEST_TEXT, &terms, 20);
+            let fragments = search_fragments(
+                &mut From::from(SimpleTokenizer::default()),
+                TEST_TEXT,
+                &terms,
+                20,
+            );
             {
                 let first = &fragments[0];
                 assert_eq!(first.score, 1.0);
@@ -434,7 +529,12 @@ Survey in 2016, 2017, and 2018."#;
                 String::from("rust") =>0.9,
                 String::from("language") => 1.0
             };
-            let fragments = search_fragments(&From::from(SimpleTokenizer), TEST_TEXT, &terms, 20);
+            let fragments = search_fragments(
+                &mut From::from(SimpleTokenizer::default()),
+                TEST_TEXT,
+                &terms,
+                20,
+            );
             // assert_eq!(fragments.len(), 7);
             {
                 let first = &fragments[0];
@@ -453,7 +553,8 @@ Survey in 2016, 2017, and 2018."#;
         let mut terms = BTreeMap::new();
         terms.insert(String::from("c"), 1.0);
 
-        let fragments = search_fragments(&From::from(SimpleTokenizer), text, &terms, 3);
+        let fragments =
+            search_fragments(&mut From::from(SimpleTokenizer::default()), text, &terms, 3);
 
         assert_eq!(fragments.len(), 1);
         {
@@ -475,7 +576,8 @@ Survey in 2016, 2017, and 2018."#;
         let mut terms = BTreeMap::new();
         terms.insert(String::from("f"), 1.0);
 
-        let fragments = search_fragments(&From::from(SimpleTokenizer), text, &terms, 3);
+        let fragments =
+            search_fragments(&mut From::from(SimpleTokenizer::default()), text, &terms, 3);
 
         assert_eq!(fragments.len(), 2);
         {
@@ -498,7 +600,8 @@ Survey in 2016, 2017, and 2018."#;
         terms.insert(String::from("f"), 1.0);
         terms.insert(String::from("a"), 0.9);
 
-        let fragments = search_fragments(&From::from(SimpleTokenizer), text, &terms, 7);
+        let fragments =
+            search_fragments(&mut From::from(SimpleTokenizer::default()), text, &terms, 7);
 
         assert_eq!(fragments.len(), 2);
         {
@@ -520,7 +623,8 @@ Survey in 2016, 2017, and 2018."#;
         let mut terms = BTreeMap::new();
         terms.insert(String::from("z"), 1.0);
 
-        let fragments = search_fragments(&From::from(SimpleTokenizer), text, &terms, 3);
+        let fragments =
+            search_fragments(&mut From::from(SimpleTokenizer::default()), text, &terms, 3);
 
         assert_eq!(fragments.len(), 0);
 
@@ -535,7 +639,8 @@ Survey in 2016, 2017, and 2018."#;
         let text = "a b c d";
 
         let terms = BTreeMap::new();
-        let fragments = search_fragments(&From::from(SimpleTokenizer), text, &terms, 3);
+        let fragments =
+            search_fragments(&mut From::from(SimpleTokenizer::default()), text, &terms, 3);
         assert_eq!(fragments.len(), 0);
 
         let snippet = select_best_fragment_combination(&fragments[..], text);
@@ -638,11 +743,12 @@ Survey in 2016, 2017, and 2018."#;
 
     #[test]
     fn test_collapse_overlapped_ranges() {
-        assert_eq!(&collapse_overlapped_ranges(&[0..1, 2..3,]), &[0..1, 2..3]);
-        assert_eq!(&collapse_overlapped_ranges(&[0..1, 1..2,]), &[0..1, 1..2]);
-        assert_eq!(&collapse_overlapped_ranges(&[0..2, 1..2,]), &[0..2]);
-        assert_eq!(&collapse_overlapped_ranges(&[0..2, 1..3,]), &[0..3]);
-        assert_eq!(&collapse_overlapped_ranges(&[0..3, 1..2,]), &[0..3]);
+        #![allow(clippy::single_range_in_vec_init)]
+        assert_eq!(&collapse_overlapped_ranges(&[0..1, 2..3]), &[0..1, 2..3]);
+        assert_eq!(&collapse_overlapped_ranges(&[0..1, 1..2]), &[0..1, 1..2]);
+        assert_eq!(&collapse_overlapped_ranges(&[0..2, 1..2]), &[0..2]);
+        assert_eq!(&collapse_overlapped_ranges(&[0..2, 1..3]), &[0..3]);
+        assert_eq!(&collapse_overlapped_ranges(&[0..3, 1..2]), &[0..3]);
     }
 
     #[test]
@@ -654,7 +760,7 @@ Survey in 2016, 2017, and 2018."#;
         terms.insert(String::from("bc"), 1.0);
 
         let fragments = search_fragments(
-            &From::from(NgramTokenizer::all_ngrams(2, 2)),
+            &mut From::from(NgramTokenizer::all_ngrams(2, 2).unwrap()),
             text,
             &terms,
             3,
@@ -671,5 +777,28 @@ Survey in 2016, 2017, and 2018."#;
         let snippet = select_best_fragment_combination(&fragments[..], text);
         assert_eq!(snippet.fragment, "abc");
         assert_eq!(snippet.to_html(), "<b>abc</b>");
+    }
+
+    #[test]
+    fn test_snippet_generator_custom_highlighted_elements() {
+        let terms = btreemap! { String::from("rust") => 1.0, String::from("language") => 0.9 };
+        let fragments = search_fragments(
+            &mut From::from(SimpleTokenizer::default()),
+            TEST_TEXT,
+            &terms,
+            100,
+        );
+        let mut snippet = select_best_fragment_combination(&fragments[..], TEST_TEXT);
+        assert_eq!(
+            snippet.to_html(),
+            "<b>Rust</b> is a systems programming <b>language</b> sponsored by\nMozilla which \
+             describes it as a &quot;safe"
+        );
+        snippet.set_snippet_prefix_postfix("<q class=\"super\">", "</q>");
+        assert_eq!(
+            snippet.to_html(),
+            "<q class=\"super\">Rust</q> is a systems programming <q class=\"super\">language</q> \
+             sponsored by\nMozilla which describes it as a &quot;safe"
+        );
     }
 }

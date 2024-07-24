@@ -1,11 +1,10 @@
 use std::collections::HashMap;
-use std::io::{self, BufWriter, Cursor, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::{fmt, result};
 
 use common::HasLen;
-use fail::fail_point;
 
 use super::FileHandle;
 use crate::core::META_FILEPATH;
@@ -49,12 +48,6 @@ impl Drop for VecWriter {
     }
 }
 
-impl Seek for VecWriter {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.data.seek(pos)
-    }
-}
-
 impl Write for VecWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.is_flushed = false;
@@ -92,7 +85,7 @@ impl InnerDirectory {
         self.fs
             .get(path)
             .ok_or_else(|| OpenReadError::FileDoesNotExist(PathBuf::from(path)))
-            .map(Clone::clone)
+            .cloned()
     }
 
     fn delete(&mut self, path: &Path) -> result::Result<(), DeleteError> {
@@ -184,7 +177,7 @@ impl Directory for RamDirectory {
     }
 
     fn delete(&self, path: &Path) -> result::Result<(), DeleteError> {
-        fail_point!("RamDirectory::delete", |_| {
+        crate::fail_point!("RamDirectory::delete", |_| {
             Err(DeleteError::IoError {
                 io_error: Arc::new(io::Error::from(io::ErrorKind::Other)),
                 filepath: path.to_path_buf(),

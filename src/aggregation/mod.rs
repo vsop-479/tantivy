@@ -24,6 +24,9 @@
 //! ## JSON Format
 //! Aggregations request and result structures de/serialize into elasticsearch compatible JSON.
 //!
+//! Notice: Intermediate aggregation results should not be de/serialized via JSON format.
+//! Postcard is a good choice.
+//!
 //! ```verbatim
 //! let agg_req: Aggregations = serde_json::from_str(json_request_string).unwrap();
 //! let collector = AggregationCollector::from_aggs(agg_req, None);
@@ -35,48 +38,25 @@
 //! ## Supported Aggregations
 //! - [Bucket](bucket)
 //!     - [Histogram](bucket::HistogramAggregation)
+//!     - [DateHistogram](bucket::DateHistogramAggregationReq)
 //!     - [Range](bucket::RangeAggregation)
 //!     - [Terms](bucket::TermsAggregation)
 //! - [Metric](metric)
 //!     - [Average](metric::AverageAggregation)
 //!     - [Stats](metric::StatsAggregation)
+//!     - [ExtendedStats](metric::ExtendedStatsAggregation)
 //!     - [Min](metric::MinAggregation)
 //!     - [Max](metric::MaxAggregation)
 //!     - [Sum](metric::SumAggregation)
 //!     - [Count](metric::CountAggregation)
+//!     - [Percentiles](metric::PercentilesAggregationReq)
+//!     - [Cardinality](metric::CardinalityAggregationReq)
+//!     - [TopHits](metric::TopHitsAggregationReq)
 //!
 //! # Example
 //! Compute the average metric, by building [`agg_req::Aggregations`], which is built from an
 //! `(String, agg_req::Aggregation)` iterator.
 //!
-//! ```
-//! use tantivy::aggregation::agg_req::{Aggregations, Aggregation, MetricAggregation};
-//! use tantivy::aggregation::AggregationCollector;
-//! use tantivy::aggregation::metric::AverageAggregation;
-//! use tantivy::query::AllQuery;
-//! use tantivy::aggregation::agg_result::AggregationResults;
-//! use tantivy::IndexReader;
-//!
-//! # #[allow(dead_code)]
-//! fn aggregate_on_index(reader: &IndexReader) {
-//!     let agg_req: Aggregations = vec![
-//!     (
-//!             "average".to_string(),
-//!             Aggregation::Metric(MetricAggregation::Average(
-//!                 AverageAggregation::from_field_name("score".to_string()),
-//!             )),
-//!         ),
-//!     ]
-//!     .into_iter()
-//!     .collect();
-//!
-//!     let collector = AggregationCollector::from_aggs(agg_req, Default::default());
-//!
-//!     let searcher = reader.searcher();
-//!     let agg_res: AggregationResults = searcher.search(&AllQuery, &collector).unwrap();
-//! }
-//! ```
-//! # Example JSON
 //! Requests are compatible with the elasticsearch JSON request format.
 //!
 //! ```
@@ -116,32 +96,24 @@
 //! aggregation and then calculate the average on each bucket.
 //! ```
 //! use tantivy::aggregation::agg_req::*;
-//! use tantivy::aggregation::metric::AverageAggregation;
-//! use tantivy::aggregation::bucket::RangeAggregation;
-//! let sub_agg_req_1: Aggregations = vec![(
-//!    "average_in_range".to_string(),
-//!         Aggregation::Metric(MetricAggregation::Average(
-//!             AverageAggregation::from_field_name("score".to_string()),
-//!         )),
-//! )]
-//! .into_iter()
-//! .collect();
+//! use serde_json::json;
 //!
-//! let agg_req_1: Aggregations = vec![
-//!     (
-//!         "range".to_string(),
-//!         Aggregation::Bucket(Box::new(BucketAggregation {
-//!             bucket_agg: BucketAggregationType::Range(RangeAggregation{
-//!                 field: "score".to_string(),
-//!                 ranges: vec![(3f64..7f64).into(), (7f64..20f64).into()],
-//!                 keyed: false,
-//!             }),
-//!             sub_aggregation: sub_agg_req_1.clone(),
-//!         })),
-//!     ),
-//! ]
-//! .into_iter()
-//! .collect();
+//! let agg_req_1: Aggregations = serde_json::from_value(json!({
+//!     "rangef64": {
+//!         "range": {
+//!             "field": "score",
+//!             "ranges": [
+//!                 { "from": 3, "to": 7000 },
+//!                 { "from": 7000, "to": 20000 },
+//!                 { "from": 50000, "to": 60000 }
+//!             ]
+//!         },
+//!         "aggs": {
+//!             "average_in_range": { "avg": { "field": "score" } }
+//!         }
+//!     },
+//! }))
+//! .unwrap();
 //! ```
 //!
 //! # Distributed Aggregation
@@ -153,7 +125,7 @@
 //! [`merge_fruits`](intermediate_agg_result::IntermediateAggregationResults::merge_fruits) method
 //! to merge multiple results. The merged result can then be converted into
 //! [`AggregationResults`](agg_result::AggregationResults) via the
-//! [`into_final_bucket_result`](intermediate_agg_result::IntermediateAggregationResults::into_final_bucket_result) method.
+//! [`into_final_result`](intermediate_agg_result::IntermediateAggregationResults::into_final_result) method.
 
 mod agg_limits;
 pub mod agg_req;
@@ -174,6 +146,8 @@ use std::fmt::Display;
 #[cfg(test)]
 mod agg_tests;
 
+use core::fmt;
+
 pub use agg_limits::AggregationLimits;
 pub use collector::{
     AggregationCollector, AggregationSegmentCollector, DistributedAggregationCollector,
@@ -183,16 +157,123 @@ use columnar::{ColumnType, MonotonicallyMappableToU64};
 pub(crate) use date::format_date;
 pub use error::AggregationError;
 use itertools::Itertools;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+
+fn parse_str_into_f64<E: de::Error>(value: &str) -> Result<f64, E> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_err| de::Error::custom(format!("Failed to parse f64 from string: {value:?}")))?;
+
+    // Check if the parsed value is NaN or infinity
+    if parsed.is_nan() || parsed.is_infinite() {
+        Err(de::Error::custom(format!(
+            "Value is not a valid f64 (NaN or Infinity): {value:?}"
+        )))
+    } else {
+        Ok(parsed)
+    }
+}
+
+/// deserialize Option<f64> from string or float
+pub(crate) fn deserialize_option_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where D: Deserializer<'de> {
+    struct StringOrFloatVisitor;
+
+    impl<'de> Visitor<'de> for StringOrFloatVisitor {
+        type Value = Option<f64>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a string or a float")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where E: de::Error {
+            parse_str_into_f64(value).map(Some)
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+        where E: de::Error {
+            Ok(Some(value))
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where E: de::Error {
+            Ok(Some(value as f64))
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where E: de::Error {
+            Ok(Some(value as f64))
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where E: de::Error {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where E: de::Error {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrFloatVisitor)
+}
+
+/// deserialize f64 from string or float
+pub(crate) fn deserialize_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where D: Deserializer<'de> {
+    struct StringOrFloatVisitor;
+
+    impl<'de> Visitor<'de> for StringOrFloatVisitor {
+        type Value = f64;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a string or a float")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where E: de::Error {
+            parse_str_into_f64(value)
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+        where E: de::Error {
+            Ok(value)
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where E: de::Error {
+            Ok(value as f64)
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where E: de::Error {
+            Ok(value as f64)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrFloatVisitor)
+}
 
 /// Represents an associative array `(key => values)` in a very efficient manner.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct VecWithNames<T: Clone> {
+#[derive(PartialEq, Serialize, Deserialize)]
+pub(crate) struct VecWithNames<T> {
     pub(crate) values: Vec<T>,
     keys: Vec<String>,
 }
 
-impl<T: Clone> Default for VecWithNames<T> {
+impl<T: Clone> Clone for VecWithNames<T> {
+    fn clone(&self) -> Self {
+        Self {
+            values: self.values.clone(),
+            keys: self.keys.clone(),
+        }
+    }
+}
+
+impl<T> Default for VecWithNames<T> {
     fn default() -> Self {
         Self {
             values: Default::default(),
@@ -201,24 +282,19 @@ impl<T: Clone> Default for VecWithNames<T> {
     }
 }
 
-impl<T: Clone + std::fmt::Debug> std::fmt::Debug for VecWithNames<T> {
+impl<T: std::fmt::Debug> std::fmt::Debug for VecWithNames<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_map().entries(self.iter()).finish()
     }
 }
 
-impl<T: Clone> From<HashMap<String, T>> for VecWithNames<T> {
+impl<T> From<HashMap<String, T>> for VecWithNames<T> {
     fn from(map: HashMap<String, T>) -> Self {
         VecWithNames::from_entries(map.into_iter().collect_vec())
     }
 }
 
-impl<T: Clone> VecWithNames<T> {
-    fn extend(&mut self, entries: VecWithNames<T>) {
-        self.keys.extend(entries.keys);
-        self.values.extend(entries.values);
-    }
-
+impl<T> VecWithNames<T> {
     fn from_entries(mut entries: Vec<(String, T)>) -> Self {
         // Sort to ensure order of elements match across multiple instances
         entries.sort_by(|left, right| left.0.cmp(&right.0));
@@ -233,20 +309,11 @@ impl<T: Clone> VecWithNames<T> {
             keys: data_names,
         }
     }
-    fn into_iter(self) -> impl Iterator<Item = (String, T)> {
-        self.keys.into_iter().zip(self.values.into_iter())
-    }
     fn iter(&self) -> impl Iterator<Item = (&str, &T)> + '_ {
         self.keys().zip(self.values.iter())
     }
     fn keys(&self) -> impl Iterator<Item = &str> + '_ {
         self.keys.iter().map(|key| key.as_str())
-    }
-    fn into_values(self) -> impl Iterator<Item = T> {
-        self.values.into_iter()
-    }
-    fn values(&self) -> impl Iterator<Item = &T> + '_ {
-        self.values.iter()
     }
     fn values_mut(&mut self) -> impl Iterator<Item = &mut T> + '_ {
         self.values.iter_mut()
@@ -315,8 +382,9 @@ pub(crate) fn f64_from_fastfield_u64(val: u64, field_type: &ColumnType) -> f64 {
         ColumnType::U64 => val as f64,
         ColumnType::I64 | ColumnType::DateTime => i64::from_u64(val) as f64,
         ColumnType::F64 => f64::from_u64(val),
+        ColumnType::Bool => val as f64,
         _ => {
-            panic!("unexpected type {:?}. This should not happen", field_type)
+            panic!("unexpected type {field_type:?}. This should not happen")
         }
     }
 }
@@ -335,6 +403,7 @@ pub(crate) fn f64_to_fastfield_u64(val: f64, field_type: &ColumnType) -> Option<
         ColumnType::U64 => Some(val as u64),
         ColumnType::I64 | ColumnType::DateTime => Some((val as i64).to_u64()),
         ColumnType::F64 => Some(val.to_u64()),
+        ColumnType::Bool => Some(val as u64),
         _ => None,
     }
 }
@@ -348,12 +417,11 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::agg_req::Aggregations;
-    use super::segment_agg_result::AggregationLimits;
     use super::*;
     use crate::indexer::NoMergePolicy;
     use crate::query::{AllQuery, TermQuery};
     use crate::schema::{IndexRecordOption, Schema, TextFieldIndexing, FAST, STRING};
-    use crate::{Index, Term};
+    use crate::{Index, IndexWriter, Term};
 
     pub fn get_test_index_with_num_docs(
         merge_segments: bool,
@@ -445,7 +513,7 @@ mod tests {
                     .set_index_option(IndexRecordOption::Basic)
                     .set_fieldnorms(false),
             )
-            .set_fast()
+            .set_fast(None)
             .set_stored();
         let text_field = schema_builder.add_text_field("text", text_fieldtype.clone());
         let text_field_id = schema_builder.add_text_field("text_id", text_fieldtype);
@@ -461,7 +529,7 @@ mod tests {
         let index = Index::create_in_ram(schema_builder.build());
         {
             // let mut index_writer = index.writer_for_tests()?;
-            let mut index_writer = index.writer_with_num_threads(1, 30_000_000)?;
+            let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
             index_writer.set_merge_policy(Box::new(NoMergePolicy));
             for values in segment_and_values {
                 for (i, term) in values {
@@ -485,7 +553,7 @@ mod tests {
                 .searchable_segment_ids()
                 .expect("Searchable segments failed.");
             if segment_ids.len() > 1 {
-                let mut index_writer = index.writer_for_tests()?;
+                let mut index_writer: IndexWriter = index.writer_for_tests()?;
                 index_writer.merge(&segment_ids).wait()?;
                 index_writer.wait_merging_threads()?;
             }
@@ -500,7 +568,7 @@ mod tests {
             .set_indexing_options(
                 TextFieldIndexing::default().set_index_option(IndexRecordOption::WithFreqs),
             )
-            .set_fast()
+            .set_fast(None)
             .set_stored();
         let text_field = schema_builder.add_text_field("text", text_fieldtype);
         let date_field = schema_builder.add_date_field("date", FAST);
@@ -599,7 +667,7 @@ mod tests {
             let segment_ids = index
                 .searchable_segment_ids()
                 .expect("Searchable segments failed.");
-            let mut index_writer = index.writer_for_tests()?;
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
             index_writer.merge(&segment_ids).wait()?;
             index_writer.wait_merging_threads()?;
         }

@@ -63,7 +63,7 @@ impl FacetReader {
 #[cfg(test)]
 mod tests {
     use crate::schema::{Facet, FacetOptions, SchemaBuilder, Value, STORED};
-    use crate::{DocAddress, Document, Index};
+    use crate::{DocAddress, Index, IndexWriter, TantivyDocument};
 
     #[test]
     fn test_facet_only_indexed() {
@@ -71,7 +71,7 @@ mod tests {
         let facet_field = schema_builder.add_facet_field("facet", FacetOptions::default());
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
-        let mut index_writer = index.writer_for_tests().unwrap();
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
         index_writer
             .add_document(doc!(facet_field=>Facet::from_text("/a/b").unwrap()))
             .unwrap();
@@ -85,8 +85,12 @@ mod tests {
         let mut facet = Facet::default();
         facet_reader.facet_from_ord(0, &mut facet).unwrap();
         assert_eq!(facet.to_path_string(), "/a/b");
-        let doc = searcher.doc(DocAddress::new(0u32, 0u32)).unwrap();
-        let value = doc.get_first(facet_field).and_then(Value::as_facet);
+        let doc = searcher
+            .doc::<TantivyDocument>(DocAddress::new(0u32, 0u32))
+            .unwrap();
+        let value = doc
+            .get_first(facet_field)
+            .and_then(|v| v.as_value().as_facet());
         assert_eq!(value, None);
     }
 
@@ -96,7 +100,7 @@ mod tests {
         let facet_field = schema_builder.add_facet_field("facet", FacetOptions::default());
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
-        let mut index_writer = index.writer_for_tests().unwrap();
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
         index_writer
             .add_document(doc!(facet_field=>Facet::from_text("/parent/child1").unwrap()))
             .unwrap();
@@ -142,9 +146,12 @@ mod tests {
         let mut facet_ords = Vec::new();
         facet_ords.extend(facet_reader.facet_ords(0u32));
         assert_eq!(&facet_ords, &[0u64]);
-        let doc = searcher.doc(DocAddress::new(0u32, 0u32))?;
-        let value: Option<&Facet> = doc.get_first(facet_field).and_then(Value::as_facet);
-        assert_eq!(value, Facet::from_text("/a/b").ok().as_ref());
+        let doc = searcher.doc::<TantivyDocument>(DocAddress::new(0u32, 0u32))?;
+        let value: Option<Facet> = doc
+            .get_first(facet_field)
+            .and_then(|v| v.as_facet())
+            .map(|facet| Facet::from_encoded_string(facet.to_string()));
+        assert_eq!(value, Facet::from_text("/a/b").ok());
         Ok(())
     }
 
@@ -156,7 +163,7 @@ mod tests {
         let index = Index::create_in_ram(schema);
         let mut index_writer = index.writer_for_tests()?;
         index_writer.add_document(doc!(facet_field=>Facet::from_text("/a/b").unwrap()))?;
-        index_writer.add_document(Document::default())?;
+        index_writer.add_document(TantivyDocument::default())?;
         index_writer.commit()?;
         let searcher = index.reader()?.searcher();
         let facet_reader = searcher.segment_reader(0u32).facet_reader("facet").unwrap();
@@ -176,8 +183,8 @@ mod tests {
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
         let mut index_writer = index.writer_for_tests()?;
-        index_writer.add_document(Document::default())?;
-        index_writer.add_document(Document::default())?;
+        index_writer.add_document(TantivyDocument::default())?;
+        index_writer.add_document(TantivyDocument::default())?;
         index_writer.commit()?;
         let searcher = index.reader()?.searcher();
         let facet_reader = searcher.segment_reader(0u32).facet_reader("facet").unwrap();

@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{btree_map, BTreeMap, BTreeSet, BinaryHeap};
+use std::io;
 use std::ops::Bound;
-use std::{io, u64, usize};
 
 use crate::collector::{Collector, SegmentCollector};
 use crate::fastfield::FacetReader;
@@ -89,7 +89,7 @@ fn facet_depth(facet_bytes: &[u8]) -> usize {
 ///     let schema = schema_builder.build();
 ///     let index = Index::create_in_ram(schema);
 ///     {
-///         let mut index_writer = index.writer(3_000_000)?;
+///         let mut index_writer = index.writer(15_000_000)?;
 ///         // a document can be associated with any number of facets
 ///         index_writer.add_document(doc!(
 ///             title => "The Name of the Wind",
@@ -158,6 +158,21 @@ fn facet_depth(facet_bytes: &[u8]) -> usize {
 ///         let facets: Vec<(&Facet, u64)> = facet_counts.top_k("/category/fiction", 1);
 ///         assert_eq!(facets, vec![
 ///             (&Facet::from("/category/fiction/fantasy"), 2)
+///         ]);
+///     }
+///
+///     {
+///         let mut facet_collector = FacetCollector::for_field("facet");
+///         facet_collector.add_facet("/");
+///         let facet_counts = searcher.search(&AllQuery, &facet_collector)?;
+///
+///         // This lists all of the facet counts
+///         let facets: Vec<(&Facet, u64)> = facet_counts
+///             .get("/")
+///             .collect();
+///         assert_eq!(facets, vec![
+///             (&Facet::from("/category"), 4),
+///             (&Facet::from("/lang"), 4)
 ///         ]);
 ///     }
 ///
@@ -285,6 +300,9 @@ fn is_child_facet(parent_facet: &[u8], possible_child_facet: &[u8]) -> bool {
     if !possible_child_facet.starts_with(parent_facet) {
         return false;
     }
+    if parent_facet.is_empty() {
+        return true;
+    }
     possible_child_facet.get(parent_facet.len()).copied() == Some(0u8)
 }
 
@@ -392,6 +410,7 @@ impl SegmentCollector for FacetSegmentCollector {
 
 /// Intermediary result of the `FacetCollector` that stores
 /// the facet counts for all the segments.
+#[derive(Default, Clone)]
 pub struct FacetCounts {
     facet_counts: BTreeMap<Facet, u64>,
 }
@@ -414,8 +433,8 @@ impl FacetCounts {
     pub fn get<T>(&self, facet_from: T) -> FacetChildIterator<'_>
     where Facet: From<T> {
         let facet = Facet::from(facet_from);
-        let left_bound = Bound::Excluded(facet.clone());
-        let right_bound = if facet.is_root() {
+        let lower_bound = Bound::Excluded(facet.clone());
+        let upper_bound = if facet.is_root() {
             Bound::Unbounded
         } else {
             let mut facet_after_bytes: String = facet.encoded_str().to_owned();
@@ -424,7 +443,7 @@ impl FacetCounts {
             Bound::Excluded(facet_after)
         };
         let underlying: btree_map::Range<'_, _, _> =
-            self.facet_counts.range((left_bound, right_bound));
+            self.facet_counts.range((lower_bound, upper_bound));
         FacetChildIterator { underlying }
     }
 
@@ -475,10 +494,10 @@ mod tests {
     use super::{FacetCollector, FacetCounts};
     use crate::collector::facet_collector::compress_mapping;
     use crate::collector::Count;
-    use crate::core::Index;
+    use crate::index::Index;
     use crate::query::{AllQuery, QueryParser, TermQuery};
-    use crate::schema::{Document, Facet, FacetOptions, IndexRecordOption, Schema};
-    use crate::Term;
+    use crate::schema::{Facet, FacetOptions, IndexRecordOption, Schema, TantivyDocument};
+    use crate::{IndexWriter, Term};
 
     fn test_collapse_mapping_aux(
         facet_terms: &[&str],
@@ -541,7 +560,7 @@ mod tests {
         let facet_field = schema_builder.add_facet_field("facet", FacetOptions::default());
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
-        let mut index_writer = index.writer_for_tests().unwrap();
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
         index_writer
             .add_document(doc!(facet_field=>Facet::from("/facet/a")))
             .unwrap();
@@ -570,7 +589,7 @@ mod tests {
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
 
-        let mut index_writer = index.writer_for_tests().unwrap();
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
         let num_facets: usize = 3 * 4 * 5;
         let facets: Vec<Facet> = (0..num_facets)
             .map(|mut n| {
@@ -579,11 +598,11 @@ mod tests {
                 let mid = n % 4;
                 n /= 4;
                 let leaf = n % 5;
-                Facet::from(&format!("/top{}/mid{}/leaf{}", top, mid, leaf))
+                Facet::from(&format!("/top{top}/mid{mid}/leaf{leaf}"))
             })
             .collect();
         for i in 0..num_facets * 10 {
-            let mut doc = Document::new();
+            let mut doc = TantivyDocument::new();
             doc.add_facet(facet_field, facets[i % num_facets].clone());
             index_writer.add_document(doc).unwrap();
         }
@@ -714,24 +733,25 @@ mod tests {
         let index = Index::create_in_ram(schema);
 
         let uniform = Uniform::new_inclusive(1, 100_000);
-        let mut docs: Vec<Document> = vec![("a", 10), ("b", 100), ("c", 7), ("d", 12), ("e", 21)]
-            .into_iter()
-            .flat_map(|(c, count)| {
-                let facet = Facet::from(&format!("/facet/{}", c));
-                let doc = doc!(facet_field => facet);
-                iter::repeat(doc).take(count)
-            })
-            .map(|mut doc| {
-                doc.add_facet(
-                    facet_field,
-                    &format!("/facet/{}", thread_rng().sample(uniform)),
-                );
-                doc
-            })
-            .collect();
+        let mut docs: Vec<TantivyDocument> =
+            vec![("a", 10), ("b", 100), ("c", 7), ("d", 12), ("e", 21)]
+                .into_iter()
+                .flat_map(|(c, count)| {
+                    let facet = Facet::from(&format!("/facet/{c}"));
+                    let doc = doc!(facet_field => facet);
+                    iter::repeat(doc).take(count)
+                })
+                .map(|mut doc| {
+                    doc.add_facet(
+                        facet_field,
+                        &format!("/facet/{}", thread_rng().sample(uniform)),
+                    );
+                    doc
+                })
+                .collect();
         docs[..].shuffle(&mut thread_rng());
 
-        let mut index_writer = index.writer_for_tests().unwrap();
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
         for doc in docs {
             index_writer.add_document(doc).unwrap();
         }
@@ -762,10 +782,10 @@ mod tests {
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
 
-        let docs: Vec<Document> = vec![("b", 2), ("a", 2), ("c", 4)]
+        let docs: Vec<TantivyDocument> = vec![("b", 2), ("a", 2), ("c", 4)]
             .into_iter()
             .flat_map(|(c, count)| {
-                let facet = Facet::from(&format!("/facet/{}", c));
+                let facet = Facet::from(&format!("/facet/{c}"));
                 let doc = doc!(facet_field => facet);
                 iter::repeat(doc).take(count)
             })
@@ -789,6 +809,15 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn is_child_facet() {
+        assert!(super::is_child_facet(&b"foo"[..], &b"foo\0bar"[..]));
+        assert!(super::is_child_facet(&b""[..], &b"foo\0bar"[..]));
+        assert!(super::is_child_facet(&b""[..], &b"foo"[..]));
+        assert!(!super::is_child_facet(&b"foo\0bar"[..], &b"foo"[..]));
+        assert!(!super::is_child_facet(&b"foo"[..], &b"foobar\0baz"[..]));
+    }
 }
 
 #[cfg(all(test, feature = "unstable"))]
@@ -801,7 +830,7 @@ mod bench {
     use crate::collector::FacetCollector;
     use crate::query::AllQuery;
     use crate::schema::{Facet, Schema, INDEXED};
-    use crate::Index;
+    use crate::{Index, IndexWriter};
 
     #[bench]
     fn bench_facet_collector(b: &mut Bencher) {
@@ -812,7 +841,7 @@ mod bench {
 
         let mut docs = vec![];
         for val in 0..50 {
-            let facet = Facet::from(&format!("/facet_{}", val));
+            let facet = Facet::from(&format!("/facet_{val}"));
             for _ in 0..val * val {
                 docs.push(doc!(facet_field=>facet.clone()));
             }
@@ -820,7 +849,7 @@ mod bench {
         // 40425 docs
         docs[..].shuffle(&mut thread_rng());
 
-        let mut index_writer = index.writer_for_tests().unwrap();
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
         for doc in docs {
             index_writer.add_document(doc).unwrap();
         }

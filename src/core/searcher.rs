@@ -3,12 +3,14 @@ use std::sync::Arc;
 use std::{fmt, io};
 
 use crate::collector::Collector;
-use crate::core::{Executor, SegmentReader};
+use crate::core::Executor;
+use crate::index::{SegmentId, SegmentReader};
 use crate::query::{Bm25StatisticsProvider, EnableScoring, Query};
-use crate::schema::{Document, Schema, Term};
+use crate::schema::document::DocumentDeserialize;
+use crate::schema::{Schema, Term};
 use crate::space_usage::SearcherSpaceUsage;
 use crate::store::{CacheStats, StoreReader};
-use crate::{DocAddress, Index, Opstamp, SegmentId, TrackedObject};
+use crate::{DocAddress, Index, Opstamp, TrackedObject};
 
 /// Identifies the searcher generation accessed by a [`Searcher`].
 ///
@@ -83,7 +85,7 @@ impl Searcher {
     ///
     /// The searcher uses the segment ordinal to route the
     /// request to the right `Segment`.
-    pub fn doc(&self, doc_address: DocAddress) -> crate::Result<Document> {
+    pub fn doc<D: DocumentDeserialize>(&self, doc_address: DocAddress) -> crate::Result<D> {
         let store_reader = &self.inner.store_readers[doc_address.segment_ord as usize];
         store_reader.get(doc_address.doc_id)
     }
@@ -103,9 +105,13 @@ impl Searcher {
 
     /// Fetches a document in an asynchronous manner.
     #[cfg(feature = "quickwit")]
-    pub async fn doc_async(&self, doc_address: DocAddress) -> crate::Result<Document> {
+    pub async fn doc_async<D: DocumentDeserialize>(
+        &self,
+        doc_address: DocAddress,
+    ) -> crate::Result<D> {
+        let executor = self.inner.index.search_executor();
         let store_reader = &self.inner.store_readers[doc_address.segment_ord as usize];
-        store_reader.get_async(doc_address.doc_id).await
+        store_reader.get_async(doc_address.doc_id, executor).await
     }
 
     /// Access the schema associated with the index of this searcher.
@@ -296,6 +302,6 @@ impl fmt::Debug for Searcher {
             .iter()
             .map(SegmentReader::segment_id)
             .collect::<Vec<_>>();
-        write!(f, "Searcher({:?})", segment_ids)
+        write!(f, "Searcher({segment_ids:?})")
     }
 }

@@ -63,7 +63,6 @@ impl ColumnValues for BitpackedReader {
     fn get_val(&self, doc: u32) -> u64 {
         self.stats.min_value + self.stats.gcd.get() * self.bit_unpacker.get(doc, &self.data)
     }
-
     #[inline]
     fn min_value(&self) -> u64 {
         self.stats.min_value
@@ -83,7 +82,8 @@ impl ColumnValues for BitpackedReader {
         doc_id_range: Range<u32>,
         positions: &mut Vec<u32>,
     ) {
-        let Some(transformed_range) = transform_range_before_linear_transformation(&self.stats, range)
+        let Some(transformed_range) =
+            transform_range_before_linear_transformation(&self.stats, range)
         else {
             positions.clear();
             return;

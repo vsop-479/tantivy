@@ -21,8 +21,6 @@ const DENSE_BLOCK_THRESHOLD: u32 =
 
 const ELEMENTS_PER_BLOCK: u32 = u16::MAX as u32 + 1;
 
-const BLOCK_SIZE: RowId = 1 << 16;
-
 #[derive(Copy, Clone, Debug)]
 struct BlockMeta {
     non_null_rows_before_block: u32,
@@ -88,8 +86,14 @@ pub struct OptionalIndex {
     block_metas: Arc<[BlockMeta]>,
 }
 
+impl<'a> Iterable<u32> for &'a OptionalIndex {
+    fn boxed_iter(&self) -> Box<dyn Iterator<Item = u32> + '_> {
+        Box::new(self.iter_rows())
+    }
+}
+
 impl std::fmt::Debug for OptionalIndex {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.debug_struct("OptionalIndex")
             .field("num_rows", &self.num_rows)
             .field("num_non_null_rows", &self.num_non_null_rows)
@@ -109,8 +113,8 @@ struct RowAddr {
 #[inline(always)]
 fn row_addr_from_row_id(row_id: RowId) -> RowAddr {
     RowAddr {
-        block_id: (row_id / BLOCK_SIZE) as u16,
-        in_block_row_id: (row_id % BLOCK_SIZE) as u16,
+        block_id: (row_id / ELEMENTS_PER_BLOCK) as u16,
+        in_block_row_id: (row_id % ELEMENTS_PER_BLOCK) as u16,
     }
 }
 
@@ -185,14 +189,20 @@ impl Set<RowId> for OptionalIndex {
         }
     }
 
+    /// Any value doc_id is allowed.
+    /// In particular, doc_id = num_rows.
     #[inline]
     fn rank(&self, doc_id: DocId) -> RowId {
+        if doc_id >= self.num_docs() {
+            return self.num_non_nulls();
+        }
         let RowAddr {
             block_id,
             in_block_row_id,
         } = row_addr_from_row_id(doc_id);
         let block_meta = self.block_metas[block_id as usize];
         let block = self.block(block_meta);
+
         let block_offset_row_id = match block {
             Block::Dense(dense_block) => dense_block.rank(in_block_row_id),
             Block::Sparse(sparse_block) => sparse_block.rank(in_block_row_id),
@@ -200,13 +210,15 @@ impl Set<RowId> for OptionalIndex {
         block_meta.non_null_rows_before_block + block_offset_row_id
     }
 
+    /// Any value doc_id is allowed.
+    /// In particular, doc_id = num_rows.
     #[inline]
     fn rank_if_exists(&self, doc_id: DocId) -> Option<RowId> {
         let RowAddr {
             block_id,
             in_block_row_id,
         } = row_addr_from_row_id(doc_id);
-        let block_meta = self.block_metas[block_id as usize];
+        let block_meta = *self.block_metas.get(block_id as usize)?;
         let block = self.block(block_meta);
         let block_offset_row_id = match block {
             Block::Dense(dense_block) => dense_block.rank_if_exists(in_block_row_id),
@@ -491,7 +503,7 @@ fn deserialize_optional_index_block_metadatas(
         non_null_rows_before_block += num_non_null_rows;
     }
     block_metas.resize(
-        ((num_rows + BLOCK_SIZE - 1) / BLOCK_SIZE) as usize,
+        ((num_rows + ELEMENTS_PER_BLOCK - 1) / ELEMENTS_PER_BLOCK) as usize,
         BlockMeta {
             non_null_rows_before_block,
             start_byte_offset,

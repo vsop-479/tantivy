@@ -1,27 +1,25 @@
-use std::convert::TryInto;
 use std::hash::{Hash, Hasher};
 use std::net::Ipv6Addr;
 use std::{fmt, str};
 
-use columnar::MonotonicallyMappableToU128;
+use columnar::{MonotonicallyMappableToU128, MonotonicallyMappableToU64};
+use common::json_path_writer::{JSON_END_OF_PATH, JSON_PATH_SEGMENT_SEP_STR};
+use common::JsonPathWriter;
 
+use super::date_time_options::DATE_TIME_PRECISION_INDEXED;
 use super::Field;
 use crate::fastfield::FastValue;
+use crate::json_utils::split_json_path;
 use crate::schema::{Facet, Type};
-use crate::{DatePrecision, DateTime};
-
-/// Separates the different segments of a json path.
-pub const JSON_PATH_SEGMENT_SEP: u8 = 1u8;
-pub const JSON_PATH_SEGMENT_SEP_STR: &str =
-    unsafe { std::str::from_utf8_unchecked(&[JSON_PATH_SEGMENT_SEP]) };
-
-/// Separates the json path and the value in
-/// a JSON term binary representation.
-pub const JSON_END_OF_PATH: u8 = 0u8;
+use crate::DateTime;
 
 /// Term represents the value that the token can take.
+/// It's a serialized representation over different types.
 ///
-/// It actually wraps a `Vec<u8>`.
+/// It actually wraps a `Vec<u8>`. The first 5 bytes are metadata.
+/// 4 bytes are the field id, and the last byte is the type.
+///
+/// The serialized value `ValueBytes` is considered everything after the 4 first bytes (term id).
 #[derive(Clone)]
 pub struct Term<B = Vec<u8>>(B)
 where B: AsRef<[u8]>;
@@ -30,10 +28,33 @@ where B: AsRef<[u8]>;
 const TERM_METADATA_LENGTH: usize = 5;
 
 impl Term {
-    pub(crate) fn with_capacity(capacity: usize) -> Term {
+    /// Create a new Term with a buffer with a given capacity.
+    pub fn with_capacity(capacity: usize) -> Term {
         let mut data = Vec::with_capacity(TERM_METADATA_LENGTH + capacity);
         data.resize(TERM_METADATA_LENGTH, 0u8);
         Term(data)
+    }
+
+    /// Creates a term from a json path.
+    ///
+    /// The json path can address a nested value in a JSON object.
+    /// e.g. `{"k8s": {"node": {"id": 5}}}` can be addressed via `k8s.node.id`.
+    ///
+    /// In case there are dots in the field name, and the `expand_dots_enabled` parameter is not
+    /// set they need to be escaped with a backslash.
+    /// e.g. `{"k8s.node": {"id": 5}}` can be addressed via `k8s\.node.id`.
+    pub fn from_field_json_path(field: Field, json_path: &str, expand_dots_enabled: bool) -> Term {
+        let paths = split_json_path(json_path);
+        let mut json_path = JsonPathWriter::with_expand_dots(expand_dots_enabled);
+        for path in paths {
+            json_path.push(&path);
+        }
+        json_path.set_end();
+        let mut term = Term::with_type_and_field(Type::Json, field);
+
+        term.append_bytes(json_path.as_str().as_bytes());
+
+        term
     }
 
     pub(crate) fn with_type_and_field(typ: Type, field: Field) -> Term {
@@ -99,7 +120,7 @@ impl Term {
 
     /// Builds a term given a field, and a `DateTime` value
     pub fn from_field_date(field: Field, val: DateTime) -> Term {
-        Term::from_fast_value(field, &val.truncate(DatePrecision::Seconds))
+        Term::from_fast_value(field, &val.truncate(DATE_TIME_PRECISION_INDEXED))
     }
 
     /// Creates a `Term` given a facet.
@@ -164,6 +185,31 @@ impl Term {
         self.set_bytes(val.to_u64().to_be_bytes().as_ref());
     }
 
+    /// Append a type marker + fast value to a term.
+    /// This is used in JSON type to append a fast value after the path.
+    ///
+    /// It will not clear existing bytes.
+    pub fn append_type_and_fast_value<T: FastValue>(&mut self, val: T) {
+        self.0.push(T::to_type().to_code());
+        let value = if T::to_type() == Type::Date {
+            DateTime::from_u64(val.to_u64())
+                .truncate(DATE_TIME_PRECISION_INDEXED)
+                .to_u64()
+        } else {
+            val.to_u64()
+        };
+        self.0.extend(value.to_be_bytes().as_ref());
+    }
+
+    /// Append a string type marker + string to a term.
+    /// This is used in JSON type to append a str after the path.
+    ///
+    /// It will not clear existing bytes.
+    pub fn append_type_and_str(&mut self, val: &str) {
+        self.0.push(Type::Str.to_code());
+        self.0.extend(val.as_bytes().as_ref());
+    }
+
     /// Sets a `Ipv6Addr` value in the term.
     pub fn set_ip_addr(&mut self, val: Ipv6Addr) {
         self.set_bytes(val.to_u128().to_be_bytes().as_ref());
@@ -175,19 +221,9 @@ impl Term {
         self.0.extend(bytes);
     }
 
-    /// Set the texts only, keeping the field untouched.
-    pub fn set_text(&mut self, text: &str) {
-        self.set_bytes(text.as_bytes());
-    }
-
     /// Truncates the value bytes of the term. Value and field type stays the same.
     pub fn truncate_value_bytes(&mut self, len: usize) {
         self.0.truncate(len + TERM_METADATA_LENGTH);
-    }
-
-    /// Returns the value bytes as mutable slice
-    pub fn value_bytes_mut(&mut self) -> &mut [u8] {
-        &mut self.0[TERM_METADATA_LENGTH..]
     }
 
     /// The length of the bytes.
@@ -205,44 +241,17 @@ impl Term {
         &mut self.0[len_before..]
     }
 
-    /// Appends a single byte to the term.
+    /// Appends json path bytes to the Term.
+    /// If the path contains 0 bytes, they are replaced by a "0" string.
+    /// The 0 byte is used to mark the end of the path.
+    ///
+    /// This function returns the segment that has just been added.
     #[inline]
-    pub fn push_byte(&mut self, byte: u8) {
-        self.0.push(byte);
-    }
-}
-
-impl<B> Ord for Term<B>
-where B: AsRef<[u8]>
-{
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.as_slice().cmp(other.as_slice())
-    }
-}
-
-impl<B> PartialOrd for Term<B>
-where B: AsRef<[u8]>
-{
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<B> PartialEq for Term<B>
-where B: AsRef<[u8]>
-{
-    fn eq(&self, other: &Self) -> bool {
-        self.as_slice() == other.as_slice()
-    }
-}
-
-impl<B> Eq for Term<B> where B: AsRef<[u8]> {}
-
-impl<B> Hash for Term<B>
-where B: AsRef<[u8]>
-{
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.as_ref().hash(state)
+    pub fn append_path(&mut self, bytes: &[u8]) -> &mut [u8] {
+        let len_before = self.0.len();
+        assert!(!bytes.contains(&JSON_END_OF_PATH));
+        self.0.extend_from_slice(bytes);
+        &mut self.0[len_before..]
     }
 }
 
@@ -254,23 +263,74 @@ where B: AsRef<[u8]>
         Term(data)
     }
 
+    /// Return the type of the term.
+    pub fn typ(&self) -> Type {
+        self.value().typ()
+    }
+
+    /// Returns the field.
+    pub fn field(&self) -> Field {
+        let field_id_bytes: [u8; 4] = (&self.0.as_ref()[..4]).try_into().unwrap();
+        Field::from_field_id(u32::from_be_bytes(field_id_bytes))
+    }
+
+    /// Returns the serialized representation of the value.
+    /// (this does neither include the field id nor the value type.)
+    ///
+    /// If the term is a string, its value is utf-8 encoded.
+    /// If the term is a u64, its value is encoded according
+    /// to `byteorder::BigEndian`.
+    pub fn serialized_value_bytes(&self) -> &[u8] {
+        &self.0.as_ref()[TERM_METADATA_LENGTH..]
+    }
+
+    /// Returns the value of the term.
+    /// address or JSON path + value. (this does not include the field.)
+    pub fn value(&self) -> ValueBytes<&[u8]> {
+        ValueBytes::wrap(&self.0.as_ref()[4..])
+    }
+
+    /// Returns the serialized representation of Term.
+    /// This includes field_id, value type and value.
+    ///
+    /// Do NOT rely on this byte representation in the index.
+    /// This value is likely to change in the future.
+    #[inline]
+    pub fn serialized_term(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+/// ValueBytes represents a serialized value.
+/// The value can be of any type of [`Type`] (e.g. string, u64, f64, bool, date, JSON).
+/// The serialized representation matches the lexographical order of the type.
+///
+/// The `ValueBytes` format is as follow:
+/// `[type code: u8][serialized value]`
+///
+/// For JSON `ValueBytes` equals to:
+/// `[type code=JSON][JSON path][JSON_END_OF_PATH][ValueBytes]`
+///
+/// The nested ValueBytes in JSON is never of type JSON. (there's no recursion)
+#[derive(Clone)]
+pub struct ValueBytes<B>(B)
+where B: AsRef<[u8]>;
+
+impl<B> ValueBytes<B>
+where B: AsRef<[u8]>
+{
+    /// Wraps a object holding bytes
+    pub fn wrap(data: B) -> ValueBytes<B> {
+        ValueBytes(data)
+    }
+
     fn typ_code(&self) -> u8 {
-        *self
-            .as_slice()
-            .get(4)
-            .expect("the byte representation is too short")
+        self.0.as_ref()[0]
     }
 
     /// Return the type of the term.
     pub fn typ(&self) -> Type {
         Type::from_code(self.typ_code()).expect("The term has an invalid type code")
-    }
-
-    /// Returns the field.
-    pub fn field(&self) -> Field {
-        let mut field_id_bytes = [0u8; 4];
-        field_id_bytes.copy_from_slice(&self.0.as_ref()[..4]);
-        Field::from_field_id(u32::from_be_bytes(field_id_bytes))
     }
 
     /// Returns the `u64` value stored in a term.
@@ -285,13 +345,8 @@ where B: AsRef<[u8]>
         if self.typ() != T::to_type() {
             return None;
         }
-        let mut value_bytes = [0u8; 8];
-        let bytes = self.value_bytes();
-        if bytes.len() != 8 {
-            return None;
-        }
-        value_bytes.copy_from_slice(self.value_bytes());
-        let value_u64 = u64::from_be_bytes(value_bytes);
+        let value_bytes = self.value_bytes();
+        let value_u64 = u64::from_be_bytes(value_bytes.try_into().ok()?);
         Some(T::from_u64(value_u64))
     }
 
@@ -360,94 +415,150 @@ where B: AsRef<[u8]>
         Some(self.value_bytes())
     }
 
-    /// Returns the serialized value of the term.
-    /// (this does not include the field.)
-    ///
-    /// If the term is a string, its value is utf-8 encoded.
-    /// If the term is a u64, its value is encoded according
-    /// to `byteorder::BigEndian`.
-    pub fn value_bytes(&self) -> &[u8] {
-        &self.0.as_ref()[TERM_METADATA_LENGTH..]
+    /// Returns a `Ipv6Addr` value from the term.
+    pub fn as_ip_addr(&self) -> Option<Ipv6Addr> {
+        if self.typ() != Type::IpAddr {
+            return None;
+        }
+        let ip_u128 = u128::from_be_bytes(self.value_bytes().try_into().ok()?);
+        Some(Ipv6Addr::from_u128(ip_u128))
     }
 
-    /// Returns the underlying `&[u8]`.
+    /// Returns the json path type.
+    ///
+    /// Returns `None` if the value is not JSON.
+    pub fn json_path_type(&self) -> Option<Type> {
+        let json_value_bytes = self.as_json_value_bytes()?;
+
+        Some(json_value_bytes.typ())
+    }
+
+    /// Returns the json path bytes (including the JSON_END_OF_PATH byte),
+    /// and the encoded ValueBytes after the json path.
+    ///
+    /// Returns `None` if the value is not JSON.
+    pub(crate) fn as_json(&self) -> Option<(&[u8], ValueBytes<&[u8]>)> {
+        if self.typ() != Type::Json {
+            return None;
+        }
+        let bytes = self.value_bytes();
+
+        let pos = bytes.iter().cloned().position(|b| b == JSON_END_OF_PATH)?;
+        // split at pos + 1, so that json_path_bytes includes the JSON_END_OF_PATH byte.
+        let (json_path_bytes, term) = bytes.split_at(pos + 1);
+        Some((json_path_bytes, ValueBytes::wrap(term)))
+    }
+
+    /// Returns the encoded ValueBytes after the json path.
+    ///
+    /// Returns `None` if the value is not JSON.
+    pub(crate) fn as_json_value_bytes(&self) -> Option<ValueBytes<&[u8]>> {
+        if self.typ() != Type::Json {
+            return None;
+        }
+        let bytes = self.value_bytes();
+        let pos = bytes.iter().cloned().position(|b| b == JSON_END_OF_PATH)?;
+        Some(ValueBytes::wrap(&bytes[pos + 1..]))
+    }
+
+    /// Returns the serialized value of ValueBytes without the type.
+    fn value_bytes(&self) -> &[u8] {
+        &self.0.as_ref()[1..]
+    }
+
+    /// Returns the serialized representation of Term.
     ///
     /// Do NOT rely on this byte representation in the index.
     /// This value is likely to change in the future.
-    pub fn as_slice(&self) -> &[u8] {
+    pub fn as_serialized(&self) -> &[u8] {
         self.0.as_ref()
+    }
+
+    fn debug_value_bytes(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let typ = self.typ();
+        write!(f, "type={typ:?}, ")?;
+        match typ {
+            Type::Str => {
+                let s = self.as_str();
+                write_opt(f, s)?;
+            }
+            Type::U64 => {
+                write_opt(f, self.as_u64())?;
+            }
+            Type::I64 => {
+                write_opt(f, self.as_i64())?;
+            }
+            Type::F64 => {
+                write_opt(f, self.as_f64())?;
+            }
+            Type::Bool => {
+                write_opt(f, self.as_bool())?;
+            }
+            // TODO pretty print these types too.
+            Type::Date => {
+                write_opt(f, self.as_date())?;
+            }
+            Type::Facet => {
+                write_opt(f, self.as_facet())?;
+            }
+            Type::Bytes => {
+                write_opt(f, self.as_bytes())?;
+            }
+            Type::Json => {
+                if let Some((path_bytes, sub_value_bytes)) = self.as_json() {
+                    // Remove the JSON_END_OF_PATH byte & convert to utf8.
+                    let path = str::from_utf8(&path_bytes[..path_bytes.len() - 1])
+                        .map_err(|_| std::fmt::Error)?;
+                    let path_pretty = path.replace(JSON_PATH_SEGMENT_SEP_STR, ".");
+                    write!(f, "path={path_pretty}, ")?;
+                    sub_value_bytes.debug_value_bytes(f)?;
+                }
+            }
+            Type::IpAddr => {
+                write_opt(f, self.as_ip_addr())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<B> Ord for Term<B>
+where B: AsRef<[u8]>
+{
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.serialized_term().cmp(other.serialized_term())
+    }
+}
+
+impl<B> PartialOrd for Term<B>
+where B: AsRef<[u8]>
+{
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<B> PartialEq for Term<B>
+where B: AsRef<[u8]>
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.serialized_term() == other.serialized_term()
+    }
+}
+
+impl<B> Eq for Term<B> where B: AsRef<[u8]> {}
+
+impl<B> Hash for Term<B>
+where B: AsRef<[u8]>
+{
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.as_ref().hash(state)
     }
 }
 
 fn write_opt<T: std::fmt::Debug>(f: &mut fmt::Formatter, val_opt: Option<T>) -> fmt::Result {
     if let Some(val) = val_opt {
-        write!(f, "{:?}", val)?;
-    }
-    Ok(())
-}
-
-fn as_str(value_bytes: &[u8]) -> Option<&str> {
-    std::str::from_utf8(value_bytes).ok()
-}
-
-fn get_fast_type<T: FastValue>(bytes: &[u8]) -> Option<T> {
-    let value_u64 = u64::from_be_bytes(bytes.try_into().ok()?);
-    Some(T::from_u64(value_u64))
-}
-
-/// Returns the json path (without non-human friendly separators, the type of the value, and the
-/// value bytes). Returns `None` if the value is not JSON or is not valid.
-pub(crate) fn as_json_path_type_value_bytes(bytes: &[u8]) -> Option<(&str, Type, &[u8])> {
-    let pos = bytes.iter().cloned().position(|b| b == JSON_END_OF_PATH)?;
-    let json_path = str::from_utf8(&bytes[..pos]).ok()?;
-    let type_code = *bytes.get(pos + 1)?;
-    let typ = Type::from_code(type_code)?;
-    Some((json_path, typ, &bytes[pos + 2..]))
-}
-
-fn debug_value_bytes(typ: Type, bytes: &[u8], f: &mut fmt::Formatter) -> fmt::Result {
-    match typ {
-        Type::Str => {
-            let s = as_str(bytes);
-            write_opt(f, s)?;
-        }
-        Type::U64 => {
-            write_opt(f, get_fast_type::<u64>(bytes))?;
-        }
-        Type::I64 => {
-            write_opt(f, get_fast_type::<i64>(bytes))?;
-        }
-        Type::F64 => {
-            write_opt(f, get_fast_type::<f64>(bytes))?;
-        }
-        Type::Bool => {
-            write_opt(f, get_fast_type::<bool>(bytes))?;
-        }
-        // TODO pretty print these types too.
-        Type::Date => {
-            write_opt(f, get_fast_type::<DateTime>(bytes))?;
-        }
-        Type::Facet => {
-            let facet_str = str::from_utf8(bytes)
-                .ok()
-                .map(ToString::to_string)
-                .map(Facet::from_encoded_string)
-                .map(|facet| facet.to_path_string());
-            write_opt(f, facet_str)?;
-        }
-        Type::Bytes => {
-            write_opt(f, Some(bytes))?;
-        }
-        Type::Json => {
-            if let Some((path, typ, bytes)) = as_json_path_type_value_bytes(bytes) {
-                let path_pretty = path.replace(JSON_PATH_SEGMENT_SEP_STR, ".");
-                write!(f, "path={path_pretty}, vtype={typ:?}, ")?;
-                debug_value_bytes(typ, bytes, f)?;
-            }
-        }
-        Type::IpAddr => {
-            write!(f, "")?; // TODO change once we actually have IP address terms.
-        }
+        write!(f, "{val:?}")?;
     }
     Ok(())
 }
@@ -457,9 +568,9 @@ where B: AsRef<[u8]>
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let field_id = self.field().field_id();
-        let typ = self.typ();
-        write!(f, "Term(type={typ:?}, field={field_id}, ")?;
-        debug_value_bytes(typ, self.value_bytes(), f)?;
+        write!(f, "Term(field={field_id}, ")?;
+        let value_bytes = ValueBytes::wrap(&self.0.as_ref()[4..]);
+        value_bytes.debug_value_bytes(f)?;
         write!(f, ")",)?;
         Ok(())
     }
@@ -478,7 +589,7 @@ mod tests {
         let term = Term::from_field_text(title_field, "test");
         assert_eq!(term.field(), title_field);
         assert_eq!(term.typ(), Type::Str);
-        assert_eq!(term.as_str(), Some("test"))
+        assert_eq!(term.value().as_str(), Some("test"))
     }
 
     /// Size (in bytes) of the buffer of a fast value (u64, i64, f64, or date) term.
@@ -500,8 +611,8 @@ mod tests {
         let term = Term::from_field_u64(count_field, 983u64);
         assert_eq!(term.field(), count_field);
         assert_eq!(term.typ(), Type::U64);
-        assert_eq!(term.as_slice().len(), FAST_VALUE_TERM_LEN);
-        assert_eq!(term.as_u64(), Some(983u64))
+        assert_eq!(term.serialized_term().len(), FAST_VALUE_TERM_LEN);
+        assert_eq!(term.value().as_u64(), Some(983u64))
     }
 
     #[test]
@@ -511,7 +622,7 @@ mod tests {
         let term = Term::from_field_bool(bool_field, true);
         assert_eq!(term.field(), bool_field);
         assert_eq!(term.typ(), Type::Bool);
-        assert_eq!(term.as_slice().len(), FAST_VALUE_TERM_LEN);
-        assert_eq!(term.as_bool(), Some(true))
+        assert_eq!(term.serialized_term().len(), FAST_VALUE_TERM_LEN);
+        assert_eq!(term.value().as_bool(), Some(true))
     }
 }

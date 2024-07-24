@@ -1,28 +1,38 @@
 [package]
 name = "tantivy-columnar"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
+homepage = "https://github.com/quickwit-oss/tantivy"
+repository = "https://github.com/quickwit-oss/tantivy"
+description = "column oriented storage for tantivy"
+categories = ["database-implementations", "data-structures", "compression"]
 
 [dependencies]
-itertools = "0.10.5"
-log = "0.4.17"
-fnv = "1.0.7"
+itertools = "0.13.0"
 fastdivide = "0.4.0"
-rand = { version = "0.8.5", optional = true }
-measure_time = { version = "0.8.2", optional = true }
-prettytable-rs = { version = "0.10.0", optional = true }
 
-stacker = { path = "../stacker", package="tantivy-stacker"}
-sstable = { path = "../sstable", package = "tantivy-sstable" }
-common = { path = "../common", package = "tantivy-common" }
-tantivy-bitpacker = { version= "0.3", path = "../bitpacker/" }
+stacker = { version= "0.3", path = "../stacker", package="tantivy-stacker"}
+sstable = { version= "0.3", path = "../sstable", package = "tantivy-sstable" }
+common = { version= "0.7", path = "../common", package = "tantivy-common" }
+tantivy-bitpacker = { version= "0.6", path = "../bitpacker/" }
 serde = "1.0.152"
+downcast-rs = "1.2.0"
 
 [dev-dependencies]
 proptest = "1"
 more-asserts = "0.3.1"
-rand = "0.8.5"
+rand = "0.8"
+binggan = "0.8.1"
+
+[[bench]]
+name = "bench_merge"
+harness = false
+
+[[bench]]
+name = "bench_access"
+harness = false
+
 
 [features]
 unstable = []

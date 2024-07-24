@@ -2,12 +2,11 @@ use std::cmp::Ordering;
 use std::io::{self, Write};
 
 use common::{BinarySerializable, CountingWriter, VInt};
-use fail::fail_point;
 
 use super::TermInfo;
-use crate::core::Segment;
 use crate::directory::{CompositeWrite, WritePtr};
 use crate::fieldnorm::FieldNormReader;
+use crate::index::Segment;
 use crate::positions::PositionSerializer;
 use crate::postings::compression::{BlockEncoder, VIntEncoder, COMPRESSION_BLOCK_SIZE};
 use crate::postings::skip::SkipSerializer;
@@ -57,7 +56,7 @@ pub struct InvertedIndexSerializer {
 impl InvertedIndexSerializer {
     /// Open a new `InvertedIndexSerializer` for the given segment
     pub fn open(segment: &mut Segment) -> crate::Result<InvertedIndexSerializer> {
-        use crate::SegmentComponent::{Positions, Postings, Terms};
+        use crate::index::SegmentComponent::{Positions, Postings, Terms};
         let inv_index_serializer = InvertedIndexSerializer {
             terms_write: CompositeWrite::wrap(segment.open_write(Terms)?),
             postings_write: CompositeWrite::wrap(segment.open_write(Postings)?),
@@ -169,7 +168,12 @@ impl<'a> FieldSerializer<'a> {
     /// * term - the term. It needs to come after the previous term according to the lexicographical
     ///   order.
     /// * term_doc_freq - return the number of document containing the term.
-    pub fn new_term(&mut self, term: &[u8], term_doc_freq: u32) -> io::Result<()> {
+    pub fn new_term(
+        &mut self,
+        term: &[u8],
+        term_doc_freq: u32,
+        record_term_freq: bool,
+    ) -> io::Result<()> {
         assert!(
             !self.term_open,
             "Called new_term, while the previous term was not closed."
@@ -178,7 +182,8 @@ impl<'a> FieldSerializer<'a> {
         self.postings_serializer.clear();
         self.current_term_info = self.current_term_info();
         self.term_dictionary_builder.insert_key(term)?;
-        self.postings_serializer.new_term(term_doc_freq);
+        self.postings_serializer
+            .new_term(term_doc_freq, record_term_freq);
         Ok(())
     }
 
@@ -205,8 +210,8 @@ impl<'a> FieldSerializer<'a> {
     /// If the current block is incomplete, it needs to be encoded
     /// using `VInt` encoding.
     pub fn close_term(&mut self) -> io::Result<()> {
-        fail_point!("FieldSerializer::close_term", |msg: Option<String>| {
-            Err(io::Error::new(io::ErrorKind::Other, format!("{:?}", msg)))
+        crate::fail_point!("FieldSerializer::close_term", |msg: Option<String>| {
+            Err(io::Error::new(io::ErrorKind::Other, format!("{msg:?}")))
         });
         if self.term_open {
             self.postings_serializer
@@ -302,6 +307,7 @@ pub struct PostingsSerializer<W: Write> {
     bm25_weight: Option<Bm25Weight>,
     avg_fieldnorm: Score, /* Average number of term in the field for that segment.
                            * this value is used to compute the block wand information. */
+    term_has_freq: bool,
 }
 
 impl<W: Write> PostingsSerializer<W> {
@@ -326,13 +332,15 @@ impl<W: Write> PostingsSerializer<W> {
             fieldnorm_reader,
             bm25_weight: None,
             avg_fieldnorm,
+            term_has_freq: false,
         }
     }
 
-    pub fn new_term(&mut self, term_doc_freq: u32) {
+    pub fn new_term(&mut self, term_doc_freq: u32, record_term_freq: bool) {
         self.bm25_weight = None;
 
-        if !self.mode.has_freq() {
+        self.term_has_freq = self.mode.has_freq() && record_term_freq;
+        if !self.term_has_freq {
             return;
         }
 
@@ -347,7 +355,7 @@ impl<W: Write> PostingsSerializer<W> {
             return;
         }
 
-        self.bm25_weight = Some(Bm25Weight::for_one_term(
+        self.bm25_weight = Some(Bm25Weight::for_one_term_without_explain(
             term_doc_freq as u64,
             num_docs_in_segment,
             self.avg_fieldnorm,
@@ -366,10 +374,10 @@ impl<W: Write> PostingsSerializer<W> {
             // last el block 0, offset block 1,
             self.postings_write.extend(block_encoded);
         }
-        if self.mode.has_freq() {
+        if self.term_has_freq {
             let (num_bits, block_encoded): (u8, &[u8]) = self
                 .block_encoder
-                .compress_block_unsorted(self.block.term_freqs());
+                .compress_block_unsorted(self.block.term_freqs(), true);
             self.postings_write.extend(block_encoded);
             self.skip_write.write_term_freq(num_bits);
             if self.mode.has_positions() {
@@ -433,7 +441,7 @@ impl<W: Write> PostingsSerializer<W> {
                 self.postings_write.write_all(block_encoded)?;
             }
             // ... Idem for term frequencies
-            if self.mode.has_freq() {
+            if self.term_has_freq {
                 let block_encoded = self
                     .block_encoder
                     .compress_vint_unsorted(self.block.term_freqs());

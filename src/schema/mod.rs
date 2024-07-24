@@ -5,8 +5,10 @@
 //! Tantivy has a very strict schema.
 //! The schema defines information about the fields your index contains, that is, for each field:
 //!
-//! - the field name (may only contain letters `[a-zA-Z]`, number `[0-9]`, and `_`)
-//! - the type of the field (currently only  `text` and `u64` are supported)
+//! - the field name (may contain any characted, can't start with a `-` and can't be empty. Some
+//!   characters may require escaping when using the query parser).
+//! - the type of the field (currently `text`, `u64`, `i64`, `f64`, `bool`, `date`, `IpAddr`,
+//!   facets, bytes and json are supported)
 //! - how the field should be indexed / stored.
 //!
 //! This very last point is critical as it will enable / disable some of the functionality
@@ -104,7 +106,7 @@
 //! let schema = schema_builder.build();
 //! ```
 
-mod document;
+pub mod document;
 mod facet;
 mod facet_options;
 mod schema;
@@ -112,7 +114,6 @@ pub(crate) mod term;
 
 mod field_entry;
 mod field_type;
-mod field_value;
 
 mod bytes_options;
 mod date_time_options;
@@ -124,32 +125,27 @@ mod json_object_options;
 mod named_field_document;
 mod numeric_options;
 mod text_options;
-mod value;
 
 use columnar::ColumnType;
 
 pub use self::bytes_options::BytesOptions;
-pub use self::date_time_options::{DateOptions, DatePrecision};
-pub use self::document::Document;
+pub use self::date_time_options::{DateOptions, DateTimePrecision, DATE_TIME_PRECISION_INDEXED};
+pub use self::document::{DocParsingError, Document, OwnedValue, TantivyDocument, Value};
 pub(crate) use self::facet::FACET_SEP_BYTE;
 pub use self::facet::{Facet, FacetParseError};
 pub use self::facet_options::FacetOptions;
 pub use self::field::Field;
 pub use self::field_entry::FieldEntry;
 pub use self::field_type::{FieldType, Type};
-pub use self::field_value::FieldValue;
 pub use self::flags::{COERCE, FAST, INDEXED, STORED};
 pub use self::index_record_option::IndexRecordOption;
 pub use self::ip_options::{IntoIpv6Addr, IpAddrOptions};
 pub use self::json_object_options::JsonObjectOptions;
 pub use self::named_field_document::NamedFieldDocument;
-#[allow(deprecated)]
-pub use self::numeric_options::IntOptions;
 pub use self::numeric_options::NumericOptions;
-pub use self::schema::{DocParsingError, Schema, SchemaBuilder};
-pub use self::term::Term;
+pub use self::schema::{Schema, SchemaBuilder};
+pub use self::term::{Term, ValueBytes};
 pub use self::text_options::{TextFieldIndexing, TextOptions, STRING, TEXT};
-pub use self::value::Value;
 
 /// Validator for a potential `field_name`.
 /// Returns true if the name can be use for a field name.

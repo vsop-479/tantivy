@@ -1,21 +1,19 @@
 use std::fmt::Debug;
 use std::ops::Range;
 
-use columnar::{ColumnType, MonotonicallyMappableToU64};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
+use crate::aggregation::agg_limits::ResourceLimitGuard;
 use crate::aggregation::agg_req_with_accessor::AggregationsWithAccessor;
 use crate::aggregation::intermediate_agg_result::{
-    IntermediateAggregationResults, IntermediateBucketResult, IntermediateRangeBucketEntry,
-    IntermediateRangeBucketResult,
+    IntermediateAggregationResult, IntermediateAggregationResults, IntermediateBucketResult,
+    IntermediateRangeBucketEntry, IntermediateRangeBucketResult,
 };
 use crate::aggregation::segment_agg_result::{
-    build_segment_agg_collector, AggregationLimits, SegmentAggregationCollector,
+    build_segment_agg_collector, SegmentAggregationCollector,
 };
-use crate::aggregation::{
-    f64_from_fastfield_u64, f64_to_fastfield_u64, format_date, Key, SerializedKey, VecWithNames,
-};
+use crate::aggregation::*;
 use crate::TantivyError;
 
 /// Provide user-defined buckets to aggregate on.
@@ -71,11 +69,19 @@ pub struct RangeAggregationRange {
     pub key: Option<String>,
     /// The from range value, which is inclusive in the range.
     /// `None` equals to an open ended interval.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "deserialize_option_f64"
+    )]
     pub from: Option<f64>,
     /// The to range value, which is not inclusive in the range.
     /// `None` equals to an open ended interval.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "deserialize_option_f64"
+    )]
     pub to: Option<f64>,
 }
 
@@ -157,16 +163,18 @@ impl SegmentRangeBucketEntry {
         self,
         agg_with_accessor: &AggregationsWithAccessor,
     ) -> crate::Result<IntermediateRangeBucketEntry> {
-        let sub_aggregation = if let Some(sub_aggregation) = self.sub_aggregation {
-            sub_aggregation.into_intermediate_aggregations_result(agg_with_accessor)?
+        let mut sub_aggregation_res = IntermediateAggregationResults::default();
+        if let Some(sub_aggregation) = self.sub_aggregation {
+            sub_aggregation
+                .add_intermediate_aggregation_result(agg_with_accessor, &mut sub_aggregation_res)?
         } else {
             Default::default()
         };
 
         Ok(IntermediateRangeBucketEntry {
-            key: self.key,
+            key: self.key.into(),
             doc_count: self.doc_count,
-            sub_aggregation,
+            sub_aggregation: sub_aggregation_res,
             from: self.from,
             to: self.to,
         })
@@ -174,13 +182,14 @@ impl SegmentRangeBucketEntry {
 }
 
 impl SegmentAggregationCollector for SegmentRangeCollector {
-    fn into_intermediate_aggregations_result(
+    fn add_intermediate_aggregation_result(
         self: Box<Self>,
         agg_with_accessor: &AggregationsWithAccessor,
-    ) -> crate::Result<IntermediateAggregationResults> {
+        results: &mut IntermediateAggregationResults,
+    ) -> crate::Result<()> {
         let field_type = self.column_type;
-        let name = agg_with_accessor.buckets.keys[self.accessor_idx].to_string();
-        let sub_agg = &agg_with_accessor.buckets.values[self.accessor_idx].sub_aggregation;
+        let name = agg_with_accessor.aggs.keys[self.accessor_idx].to_string();
+        let sub_agg = &agg_with_accessor.aggs.values[self.accessor_idx].sub_aggregation;
 
         let buckets: FxHashMap<SerializedKey, IntermediateRangeBucketEntry> = self
             .buckets
@@ -200,12 +209,9 @@ impl SegmentAggregationCollector for SegmentRangeCollector {
             column_type: Some(self.column_type),
         });
 
-        let buckets = Some(VecWithNames::from_entries(vec![(name, bucket)]));
+        results.push(name, IntermediateAggregationResult::Bucket(bucket))?;
 
-        Ok(IntermediateAggregationResults {
-            metrics: None,
-            buckets,
-        })
+        Ok(())
     }
 
     #[inline]
@@ -223,13 +229,16 @@ impl SegmentAggregationCollector for SegmentRangeCollector {
         docs: &[crate::DocId],
         agg_with_accessor: &mut AggregationsWithAccessor,
     ) -> crate::Result<()> {
-        let bucket_agg_accessor = &mut agg_with_accessor.buckets.values[self.accessor_idx];
+        let bucket_agg_accessor = &mut agg_with_accessor.aggs.values[self.accessor_idx];
 
         bucket_agg_accessor
             .column_block_accessor
             .fetch_block(docs, &bucket_agg_accessor.accessor);
 
-        for (doc, val) in bucket_agg_accessor.column_block_accessor.iter_docid_vals() {
+        for (doc, val) in bucket_agg_accessor
+            .column_block_accessor
+            .iter_docid_vals(docs, &bucket_agg_accessor.accessor)
+        {
             let bucket_pos = self.get_bucket_pos(val);
 
             let bucket = &mut self.buckets[bucket_pos];
@@ -245,7 +254,7 @@ impl SegmentAggregationCollector for SegmentRangeCollector {
 
     fn flush(&mut self, agg_with_accessor: &mut AggregationsWithAccessor) -> crate::Result<()> {
         let sub_aggregation_accessor =
-            &mut agg_with_accessor.buckets.values[self.accessor_idx].sub_aggregation;
+            &mut agg_with_accessor.aggs.values[self.accessor_idx].sub_aggregation;
 
         for bucket in self.buckets.iter_mut() {
             if let Some(sub_agg) = bucket.bucket.sub_aggregation.as_mut() {
@@ -260,8 +269,8 @@ impl SegmentAggregationCollector for SegmentRangeCollector {
 impl SegmentRangeCollector {
     pub(crate) fn from_req_and_validate(
         req: &RangeAggregation,
-        sub_aggregation: &AggregationsWithAccessor,
-        limits: &AggregationLimits,
+        sub_aggregation: &mut AggregationsWithAccessor,
+        limits: &ResourceLimitGuard,
         field_type: ColumnType,
         accessor_idx: usize,
     ) -> crate::Result<Self> {
@@ -307,8 +316,7 @@ impl SegmentRangeCollector {
 
         limits.add_memory_consumed(
             buckets.len() as u64 * std::mem::size_of::<SegmentRangeAndBucketEntry>() as u64,
-        );
-        limits.validate_memory_consumption()?;
+        )?;
 
         Ok(SegmentRangeCollector {
             buckets,
@@ -441,14 +449,10 @@ pub(crate) fn range_to_key(range: &Range<u64>, field_type: &ColumnType) -> crate
 #[cfg(test)]
 mod tests {
 
-    use columnar::MonotonicallyMappableToU64;
     use serde_json::Value;
 
     use super::*;
-    use crate::aggregation::agg_req::{
-        Aggregation, Aggregations, BucketAggregation, BucketAggregationType, MetricAggregation,
-    };
-    use crate::aggregation::metric::AverageAggregation;
+    use crate::aggregation::agg_req::Aggregations;
     use crate::aggregation::tests::{
         exec_request, exec_request_with_query, get_test_index_2_segments,
         get_test_index_with_num_docs,
@@ -466,8 +470,8 @@ mod tests {
 
         SegmentRangeCollector::from_req_and_validate(
             &req,
-            &Default::default(),
-            &Default::default(),
+            &mut Default::default(),
+            &AggregationLimits::default().new_guard(),
             field_type,
             0,
         )
@@ -478,22 +482,18 @@ mod tests {
     fn range_fraction_test() -> crate::Result<()> {
         let index = get_test_index_with_num_docs(false, 100)?;
 
-        let agg_req: Aggregations = vec![(
-            "range".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Range(RangeAggregation {
-                        field: "fraction_f64".to_string(),
-                        ranges: vec![(0f64..0.1f64).into(), (0.1f64..0.2f64).into()],
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "range": {
+                "range": {
+                    "field": "fraction_f64",
+                    "ranges": [
+                        {"from": 0.0, "to": 0.1},
+                        {"from": 0.1, "to": 0.2},
+                    ]
+                },
+            }
+        }))
+        .unwrap();
 
         let res = exec_request_with_query(agg_req, &index, None)?;
 
@@ -513,31 +513,25 @@ mod tests {
     fn range_fraction_test_with_sub_agg() -> crate::Result<()> {
         let index = get_test_index_with_num_docs(false, 100)?;
 
-        let sub_agg_req: Aggregations = vec![(
-            "score_f64".to_string(),
-            Aggregation::Metric(MetricAggregation::Average(
-                AverageAggregation::from_field_name("score_f64".to_string()),
-            )),
-        )]
-        .into_iter()
-        .collect();
+        let sub_agg_req: Aggregations = serde_json::from_value(json!({
+            "avg": { "avg": { "field": "score_f64", } }
 
-        let agg_req: Aggregations = vec![(
-            "range".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Range(RangeAggregation {
-                        field: "fraction_f64".to_string(),
-                        ranges: vec![(0f64..0.1f64).into(), (0.1f64..0.2f64).into()],
-                        ..Default::default()
-                    }),
-                    sub_aggregation: sub_agg_req,
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        }))
+        .unwrap();
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "range": {
+                "range": {
+                    "field": "fraction_f64",
+                    "ranges": [
+                        {"from": 0.0, "to": 0.1},
+                        {"from": 0.1, "to": 0.2},
+                    ]
+                },
+                "aggs": sub_agg_req
+            }
+        }))
+        .unwrap();
 
         let res = exec_request_with_query(agg_req, &index, None)?;
 
@@ -557,22 +551,19 @@ mod tests {
     fn range_keyed_buckets_test() -> crate::Result<()> {
         let index = get_test_index_with_num_docs(false, 100)?;
 
-        let agg_req: Aggregations = vec![(
-            "range".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Range(RangeAggregation {
-                        field: "fraction_f64".to_string(),
-                        ranges: vec![(0f64..0.1f64).into(), (0.1f64..0.2f64).into()],
-                        keyed: true,
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "range": {
+                "range": {
+                    "field": "fraction_f64",
+                    "ranges": [
+                        {"from": 0.0, "to": 0.1},
+                        {"from": 0.1, "to": 0.2},
+                    ],
+                    "keyed": true
+                },
+            }
+        }))
+        .unwrap();
 
         let res = exec_request_with_query(agg_req, &index, None)?;
 
@@ -597,33 +588,19 @@ mod tests {
     fn range_custom_key_test() -> crate::Result<()> {
         let index = get_test_index_with_num_docs(false, 100)?;
 
-        let agg_req: Aggregations = vec![(
-            "range".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Range(RangeAggregation {
-                        field: "fraction_f64".to_string(),
-                        ranges: vec![
-                            RangeAggregationRange {
-                                key: Some("custom-key-0-to-0.1".to_string()),
-                                from: Some(0f64),
-                                to: Some(0.1f64),
-                            },
-                            RangeAggregationRange {
-                                key: None,
-                                from: Some(0.1f64),
-                                to: Some(0.2f64),
-                            },
-                        ],
-                        keyed: false,
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "range": {
+                "range": {
+                    "field": "fraction_f64",
+                    "ranges": [
+                        {"key": "custom-key-0-to-0.1", "from": 0.0, "to": 0.1},
+                        {"from": 0.1, "to": 0.2},
+                    ],
+                    "keyed": false
+                },
+            }
+        }))
+        .unwrap();
 
         let res = exec_request_with_query(agg_req, &index, None)?;
 
@@ -657,33 +634,19 @@ mod tests {
     fn range_date_test_with_opt(merge_segments: bool) -> crate::Result<()> {
         let index = get_test_index_2_segments(merge_segments)?;
 
-        let agg_req: Aggregations = vec![(
-            "date_ranges".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Range(RangeAggregation {
-                        field: "date".to_string(),
-                        ranges: vec![
-                            RangeAggregationRange {
-                                key: None,
-                                from: None,
-                                to: Some(1546300800000000.0f64),
-                            },
-                            RangeAggregationRange {
-                                key: None,
-                                from: Some(1546300800000000.0f64),
-                                to: Some(1546387200000000.0f64),
-                            },
-                        ],
-                        keyed: false,
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "date_ranges": {
+                "range": {
+                    "field": "date",
+                    "ranges": [
+                        {"to": 1546300800000000000i64},
+                        {"from": 1546300800000000000i64, "to": 1546387200000000000i64},
+                    ],
+                    "keyed": false
+                },
+            }
+        }))
+        .unwrap();
 
         let agg_res = exec_request(agg_req, &index)?;
 
@@ -722,26 +685,18 @@ mod tests {
     fn range_custom_key_keyed_buckets_test() -> crate::Result<()> {
         let index = get_test_index_with_num_docs(false, 100)?;
 
-        let agg_req: Aggregations = vec![(
-            "range".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Range(RangeAggregation {
-                        field: "fraction_f64".to_string(),
-                        ranges: vec![RangeAggregationRange {
-                            key: Some("custom-key-0-to-0.1".to_string()),
-                            from: Some(0f64),
-                            to: Some(0.1f64),
-                        }],
-                        keyed: true,
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "range": {
+                "range": {
+                    "field": "fraction_f64",
+                    "ranges": [
+                        {"key": "custom-key-0-to-0.1", "from": 0.0, "to": 0.1},
+                    ],
+                    "keyed": true
+                },
+            }
+        }))
+        .unwrap();
 
         let res = exec_request_with_query(agg_req, &index, None)?;
 

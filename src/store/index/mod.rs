@@ -41,14 +41,14 @@ mod tests {
 
     use std::io;
 
-    use proptest::strategy::{BoxedStrategy, Strategy};
+    use proptest::prelude::*;
 
     use super::{SkipIndex, SkipIndexBuilder};
     use crate::directory::OwnedBytes;
     use crate::indexer::NoMergePolicy;
     use crate::schema::{SchemaBuilder, STORED, TEXT};
     use crate::store::index::Checkpoint;
-    use crate::{DocAddress, DocId, Index, Term};
+    use crate::{DocAddress, DocId, Index, IndexWriter, TantivyDocument, Term};
 
     #[test]
     fn test_skip_index_empty() -> io::Result<()> {
@@ -129,7 +129,7 @@ mod tests {
         let body = schema_builder.add_text_field("body", STORED);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
-        let mut index_writer = index.writer_for_tests()?;
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
         index_writer.set_merge_policy(Box::new(NoMergePolicy));
         let long_text: String = "abcdefghijklmnopqrstuvwxyz".repeat(1_000);
         for _ in 0..20 {
@@ -149,7 +149,7 @@ mod tests {
         let searcher = reader.searcher();
         assert_eq!(searcher.num_docs(), 30);
         for i in 0..searcher.num_docs() as u32 {
-            let _doc = searcher.doc(DocAddress::new(0u32, i))?;
+            let _doc = searcher.doc::<TantivyDocument>(DocAddress::new(0u32, i))?;
         }
         Ok(())
     }
@@ -221,13 +221,11 @@ mod tests {
         if let Some(last_checkpoint) = checkpoints.last() {
             for doc in 0u32..last_checkpoint.doc_range.end {
                 let expected = seek_manual(skip_index.checkpoints(), doc);
-                assert_eq!(expected, skip_index.seek(doc), "Doc {}", doc);
+                assert_eq!(expected, skip_index.seek(doc), "Doc {doc}");
             }
             assert!(skip_index.seek(last_checkpoint.doc_range.end).is_none());
         }
     }
-
-    use proptest::prelude::*;
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(20))]

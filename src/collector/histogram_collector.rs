@@ -113,7 +113,7 @@ impl Collector for HistogramCollector {
         segment: &crate::SegmentReader,
     ) -> crate::Result<Self::Child> {
         let column_opt = segment.fast_fields().u64_lenient(&self.field)?;
-        let column = column_opt.ok_or_else(|| FastFieldNotAvailableError {
+        let (column, _column_type) = column_opt.ok_or_else(|| FastFieldNotAvailableError {
             field_name: self.field.clone(),
         })?;
         let column_u64 = column.first_or_default_col(0u64);
@@ -160,7 +160,7 @@ mod tests {
     use super::{add_vecs, HistogramCollector, HistogramComputer};
     use crate::schema::{Schema, FAST};
     use crate::time::{Date, Month};
-    use crate::{doc, query, DateTime, Index};
+    use crate::{query, DateTime, Index};
 
     #[test]
     fn test_add_histograms_simple() {
@@ -233,7 +233,7 @@ mod tests {
         let val_field = schema_builder.add_i64_field("val_field", FAST);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
-        let mut writer = index.writer_with_num_threads(1, 4_000_000)?;
+        let mut writer = index.writer_for_tests()?;
         writer.add_document(doc!(val_field=>12i64))?;
         writer.add_document(doc!(val_field=>-30i64))?;
         writer.add_document(doc!(val_field=>-12i64))?;
@@ -255,7 +255,7 @@ mod tests {
         let val_field = schema_builder.add_i64_field("val_field", FAST);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
-        let mut writer = index.writer_with_num_threads(1, 4_000_000)?;
+        let mut writer = index.writer_for_tests()?;
         writer.add_document(doc!(val_field=>12i64))?;
         writer.commit()?;
         writer.add_document(doc!(val_field=>-30i64))?;
@@ -280,7 +280,7 @@ mod tests {
         let date_field = schema_builder.add_date_field("date_field", FAST);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
-        let mut writer = index.writer_with_num_threads(1, 4_000_000)?;
+        let mut writer = index.writer_for_tests()?;
         writer.add_document(doc!(date_field=>DateTime::from_primitive(Date::from_calendar_date(1982, Month::September, 17)?.with_hms(0, 0, 0)?)))?;
         writer.add_document(
             doc!(date_field=>DateTime::from_primitive(Date::from_calendar_date(1986, Month::March, 9)?.with_hms(0, 0, 0)?)),
@@ -295,7 +295,7 @@ mod tests {
             DateTime::from_primitive(
                 Date::from_calendar_date(1980, Month::January, 1)?.with_hms(0, 0, 0)?,
             ),
-            3_600_000_000 * 24 * 365, // it is just for a unit test... sorry leap years.
+            3_600_000_000_000 * 24 * 365, // it is just for a unit test... sorry leap years.
             10,
         );
         let week_histogram = searcher.search(&all_query, &week_histogram_collector)?;

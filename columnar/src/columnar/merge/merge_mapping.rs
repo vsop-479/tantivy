@@ -11,6 +11,17 @@ pub struct StackMergeOrder {
 }
 
 impl StackMergeOrder {
+    #[cfg(test)]
+    pub fn stack_for_test(num_rows_per_columnar: &[u32]) -> StackMergeOrder {
+        let mut cumulated_row_ids: Vec<RowId> = Vec::with_capacity(num_rows_per_columnar.len());
+        let mut cumulated_row_id = 0;
+        for &num_rows in num_rows_per_columnar {
+            cumulated_row_id += num_rows;
+            cumulated_row_ids.push(cumulated_row_id);
+        }
+        StackMergeOrder { cumulated_row_ids }
+    }
+
     pub fn stack(columnars: &[&ColumnarReader]) -> StackMergeOrder {
         let mut cumulated_row_ids: Vec<RowId> = Vec::with_capacity(columnars.len());
         let mut cumulated_row_id = 0;
@@ -41,8 +52,8 @@ pub enum MergeRowOrder {
     /// Columnar tables are simply stacked one above the other.
     /// If the i-th columnar_readers has n_rows_i rows, then
     /// in the resulting columnar,
-    /// rows [r0..n_row_0) contains the row of columnar_readers[0], in ordder
-    /// rows [n_row_0..n_row_0 + n_row_1 contains the row of columnar_readers[1], in order.
+    /// rows [r0..n_row_0) contains the row of `columnar_readers[0]`, in ordder
+    /// rows [n_row_0..n_row_0 + n_row_1 contains the row of `columnar_readers[1]`, in order.
     /// ..
     /// No documents is deleted.
     Stack(StackMergeOrder),

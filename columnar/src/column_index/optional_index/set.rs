@@ -28,10 +28,11 @@ pub trait Set<T> {
     /// Returns true if the elements is contained in the Set
     fn contains(&self, el: T) -> bool;
 
-    /// Returns the number of rows in the set that are < `el`
+    /// Returns the element's rank (its position in the set).
+    /// If the set does not contain the element, it will return the next existing elements rank.
     fn rank(&self, el: T) -> T;
 
-    /// If the set contains `el` returns the element rank.
+    /// If the set contains `el`, returns the element's rank (its position in the set).
     /// If the set does not contain the element, it returns `None`.
     fn rank_if_exists(&self, el: T) -> Option<T>;
 
@@ -39,7 +40,8 @@ pub trait Set<T> {
     ///
     /// # Panics
     ///
-    /// May panic if rank is greater than the number of elements in the Set.
+    /// May panic if rank is greater or equal to the number of
+    /// elements in the Set.
     fn select(&self, rank: T) -> T;
 
     /// Creates a brand new select cursor.

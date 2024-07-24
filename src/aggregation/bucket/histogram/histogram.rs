@@ -1,25 +1,23 @@
 use std::cmp::Ordering;
-use std::fmt::Display;
 
-use columnar::ColumnType;
-use itertools::Itertools;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use tantivy_bitpacker::minmax;
 
 use crate::aggregation::agg_limits::MemoryConsumption;
-use crate::aggregation::agg_req::AggregationsInternal;
+use crate::aggregation::agg_req::Aggregations;
 use crate::aggregation::agg_req_with_accessor::{
-    AggregationsWithAccessor, BucketAggregationWithAccessor,
+    AggregationWithAccessor, AggregationsWithAccessor,
 };
 use crate::aggregation::agg_result::BucketEntry;
 use crate::aggregation::intermediate_agg_result::{
-    IntermediateAggregationResults, IntermediateBucketResult, IntermediateHistogramBucketEntry,
+    IntermediateAggregationResult, IntermediateAggregationResults, IntermediateBucketResult,
+    IntermediateHistogramBucketEntry,
 };
 use crate::aggregation::segment_agg_result::{
-    build_segment_agg_collector, AggregationLimits, SegmentAggregationCollector,
+    build_segment_agg_collector, SegmentAggregationCollector,
 };
-use crate::aggregation::{f64_from_fastfield_u64, format_date, VecWithNames};
+use crate::aggregation::*;
 use crate::TantivyError;
 
 /// Histogram is a bucket aggregation, where buckets are created dynamically for given `interval`.
@@ -72,6 +70,7 @@ pub struct HistogramAggregation {
     pub field: String,
     /// The interval to chunk your data range. Each bucket spans a value range of [0..interval).
     /// Must be a positive value.
+    #[serde(deserialize_with = "deserialize_f64")]
     pub interval: f64,
     /// Intervals implicitly defines an absolute grid of buckets `[interval * k, interval * (k +
     /// 1))`.
@@ -84,6 +83,7 @@ pub struct HistogramAggregation {
     /// fall into the buckets with the key 0 and 10.
     /// With offset 5 and interval 10, they would both fall into the bucket with they key 5 and the
     /// range [5..15)
+    #[serde(default, deserialize_with = "deserialize_option_f64")]
     pub offset: Option<f64>,
     /// The minimum number of documents in a bucket to be returned. Defaults to 0.
     pub min_doc_count: Option<u64>,
@@ -121,9 +121,29 @@ pub struct HistogramAggregation {
     /// Whether to return the buckets as a hash map
     #[serde(default)]
     pub keyed: bool,
+    /// Whether the values are normalized to ns for date time values. Defaults to false.
+    #[serde(default)]
+    pub is_normalized_to_ns: bool,
 }
 
 impl HistogramAggregation {
+    pub(crate) fn normalize_date_time(&mut self) {
+        if !self.is_normalized_to_ns {
+            // values are provided in ms, but the fastfield is in nano seconds
+            self.interval *= 1_000_000.0;
+            self.offset = self.offset.map(|off| off * 1_000_000.0);
+            self.hard_bounds = self.hard_bounds.map(|bounds| HistogramBounds {
+                min: bounds.min * 1_000_000.0,
+                max: bounds.max * 1_000_000.0,
+            });
+            self.extended_bounds = self.extended_bounds.map(|bounds| HistogramBounds {
+                min: bounds.min * 1_000_000.0,
+                max: bounds.max * 1_000_000.0,
+            });
+            self.is_normalized_to_ns = true;
+        }
+    }
+
     fn validate(&self) -> crate::Result<()> {
         if self.interval <= 0.0f64 {
             return Err(TantivyError::InvalidArgument(
@@ -141,9 +161,8 @@ impl HistogramAggregation {
         {
             if extended_bounds.min < hard_bounds.min || extended_bounds.max > hard_bounds.max {
                 return Err(TantivyError::InvalidArgument(format!(
-                    "extended_bounds have to be inside hard_bounds, extended_bounds: {}, \
-                     hard_bounds {}",
-                    extended_bounds, hard_bounds
+                    "extended_bounds have to be inside hard_bounds, extended_bounds: \
+                     {extended_bounds}, hard_bounds {hard_bounds}"
                 )));
             }
         }
@@ -161,9 +180,36 @@ impl HistogramAggregation {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistogramBounds {
     /// The lower bounds.
+    #[serde(deserialize_with = "deserialize_date_or_num")]
     pub min: f64,
     /// The upper bounds.
+    #[serde(deserialize_with = "deserialize_date_or_num")]
     pub max: f64,
+}
+
+fn deserialize_date_or_num<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where D: serde::Deserializer<'de> {
+    let value: serde_json::Value = Deserialize::deserialize(deserializer)?;
+
+    // Check if the value is a string representing an Rfc3339 formatted date
+    if let serde_json::Value::String(date_str) = value {
+        // Parse the Rfc3339 formatted date string into a DateTime<Utc>
+        let date =
+            time::OffsetDateTime::parse(&date_str, &time::format_description::well_known::Rfc3339)
+                .map_err(|_| serde::de::Error::custom("Invalid Rfc3339 formatted date"))?;
+
+        let milliseconds: i64 = (date.unix_timestamp_nanos() / 1_000_000)
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("{date_str} out of allowed range"))?;
+
+        // Return the milliseconds as f64
+        Ok(milliseconds as f64)
+    } else {
+        // The value is not a string, so assume it's a regular f64 number
+        value
+            .as_f64()
+            .ok_or_else(|| serde::de::Error::custom("Invalid number format"))
+    }
 }
 
 impl Display for HistogramBounds {
@@ -187,14 +233,18 @@ pub(crate) struct SegmentHistogramBucketEntry {
 impl SegmentHistogramBucketEntry {
     pub(crate) fn into_intermediate_bucket_entry(
         self,
-        sub_aggregation: Box<dyn SegmentAggregationCollector>,
+        sub_aggregation: Option<Box<dyn SegmentAggregationCollector>>,
         agg_with_accessor: &AggregationsWithAccessor,
     ) -> crate::Result<IntermediateHistogramBucketEntry> {
+        let mut sub_aggregation_res = IntermediateAggregationResults::default();
+        if let Some(sub_aggregation) = sub_aggregation {
+            sub_aggregation
+                .add_intermediate_aggregation_result(agg_with_accessor, &mut sub_aggregation_res)?;
+        }
         Ok(IntermediateHistogramBucketEntry {
             key: self.key,
             doc_count: self.doc_count,
-            sub_aggregation: sub_aggregation
-                .into_intermediate_aggregations_result(agg_with_accessor)?,
+            sub_aggregation: sub_aggregation_res,
         })
     }
 }
@@ -215,20 +265,18 @@ pub struct SegmentHistogramCollector {
 }
 
 impl SegmentAggregationCollector for SegmentHistogramCollector {
-    fn into_intermediate_aggregations_result(
+    fn add_intermediate_aggregation_result(
         self: Box<Self>,
         agg_with_accessor: &AggregationsWithAccessor,
-    ) -> crate::Result<IntermediateAggregationResults> {
-        let name = agg_with_accessor.buckets.keys[self.accessor_idx].to_string();
-        let agg_with_accessor = &agg_with_accessor.buckets.values[self.accessor_idx];
+        results: &mut IntermediateAggregationResults,
+    ) -> crate::Result<()> {
+        let name = agg_with_accessor.aggs.keys[self.accessor_idx].to_string();
+        let agg_with_accessor = &agg_with_accessor.aggs.values[self.accessor_idx];
 
         let bucket = self.into_intermediate_bucket_result(agg_with_accessor)?;
-        let buckets = Some(VecWithNames::from_entries(vec![(name, bucket)]));
+        results.push(name, IntermediateAggregationResult::Bucket(bucket))?;
 
-        Ok(IntermediateAggregationResults {
-            metrics: None,
-            buckets,
-        })
+        Ok(())
     }
 
     #[inline]
@@ -246,7 +294,7 @@ impl SegmentAggregationCollector for SegmentHistogramCollector {
         docs: &[crate::DocId],
         agg_with_accessor: &mut AggregationsWithAccessor,
     ) -> crate::Result<()> {
-        let bucket_agg_accessor = &mut agg_with_accessor.buckets.values[self.accessor_idx];
+        let bucket_agg_accessor = &mut agg_with_accessor.aggs.values[self.accessor_idx];
 
         let mem_pre = self.get_memory_consumption();
 
@@ -259,7 +307,10 @@ impl SegmentAggregationCollector for SegmentHistogramCollector {
             .column_block_accessor
             .fetch_block(docs, &bucket_agg_accessor.accessor);
 
-        for (doc, val) in bucket_agg_accessor.column_block_accessor.iter_docid_vals() {
+        for (doc, val) in bucket_agg_accessor
+            .column_block_accessor
+            .iter_docid_vals(docs, &bucket_agg_accessor.accessor)
+        {
             let val = self.f64_from_fastfield_u64(val);
 
             let bucket_pos = get_bucket_pos(val);
@@ -280,16 +331,18 @@ impl SegmentAggregationCollector for SegmentHistogramCollector {
         }
 
         let mem_delta = self.get_memory_consumption() - mem_pre;
-        let limits = &agg_with_accessor.buckets.values[self.accessor_idx].limits;
-        limits.add_memory_consumed(mem_delta as u64);
-        limits.validate_memory_consumption()?;
+        if mem_delta > 0 {
+            bucket_agg_accessor
+                .limits
+                .add_memory_consumed(mem_delta as u64)?;
+        }
 
         Ok(())
     }
 
     fn flush(&mut self, agg_with_accessor: &mut AggregationsWithAccessor) -> crate::Result<()> {
         let sub_aggregation_accessor =
-            &mut agg_with_accessor.buckets.values[self.accessor_idx].sub_aggregation;
+            &mut agg_with_accessor.aggs.values[self.accessor_idx].sub_aggregation;
 
         for sub_aggregation in self.sub_aggregations.values_mut() {
             sub_aggregation.flush(sub_aggregation_accessor)?;
@@ -306,39 +359,39 @@ impl SegmentHistogramCollector {
         let buckets_mem = self.buckets.memory_consumption();
         self_mem + sub_aggs_mem + buckets_mem
     }
+    /// Converts the collector result into a intermediate bucket result.
     pub fn into_intermediate_bucket_result(
         self,
-        agg_with_accessor: &BucketAggregationWithAccessor,
+        agg_with_accessor: &AggregationWithAccessor,
     ) -> crate::Result<IntermediateBucketResult> {
         let mut buckets = Vec::with_capacity(self.buckets.len());
 
-        if self.sub_aggregation_blueprint.is_some() {
-            for (bucket_pos, bucket) in self.buckets.into_iter() {
-                let bucket_res = bucket.into_intermediate_bucket_entry(
-                    self.sub_aggregations.get(&bucket_pos).unwrap().clone(),
-                    &agg_with_accessor.sub_aggregation,
-                );
+        for (bucket_pos, bucket) in self.buckets {
+            let bucket_res = bucket.into_intermediate_bucket_entry(
+                self.sub_aggregations.get(&bucket_pos).cloned(),
+                &agg_with_accessor.sub_aggregation,
+            );
 
-                buckets.push(bucket_res?);
-            }
-        } else {
-            buckets.extend(self.buckets.into_values().map(|bucket| bucket.into()));
-        };
-        buckets.sort_unstable_by(|b1, b2| b1.key.partial_cmp(&b2.key).unwrap_or(Ordering::Equal));
+            buckets.push(bucket_res?);
+        }
+        buckets.sort_unstable_by(|b1, b2| b1.key.total_cmp(&b2.key));
 
         Ok(IntermediateBucketResult::Histogram {
             buckets,
-            column_type: Some(self.column_type),
+            is_date_agg: self.column_type == ColumnType::DateTime,
         })
     }
 
     pub(crate) fn from_req_and_validate(
-        req: &HistogramAggregation,
-        sub_aggregation: &AggregationsWithAccessor,
+        mut req: HistogramAggregation,
+        sub_aggregation: &mut AggregationsWithAccessor,
         field_type: ColumnType,
         accessor_idx: usize,
     ) -> crate::Result<Self> {
         req.validate()?;
+        if field_type == ColumnType::DateTime {
+            req.normalize_date_time();
+        }
 
         let sub_aggregation_blueprint = if sub_aggregation.is_empty() {
             None
@@ -384,7 +437,7 @@ fn get_bucket_key_from_pos(bucket_pos: f64, interval: f64, offset: f64) -> f64 {
 fn intermediate_buckets_to_final_buckets_fill_gaps(
     buckets: Vec<IntermediateHistogramBucketEntry>,
     histogram_req: &HistogramAggregation,
-    sub_aggregation: &AggregationsInternal,
+    sub_aggregation: &Aggregations,
     limits: &AggregationLimits,
 ) -> crate::Result<Vec<BucketEntry>> {
     // Generate the full list of buckets without gaps.
@@ -396,13 +449,13 @@ fn intermediate_buckets_to_final_buckets_fill_gaps(
     // memory check upfront
     let (_, first_bucket_num, last_bucket_num) =
         generate_bucket_pos_with_opt_minmax(histogram_req, min_max);
-    let added_buckets = (first_bucket_num..=last_bucket_num)
-        .count()
-        .saturating_sub(buckets.len());
+
+    // It's based on user input, so we need to account for overflows
+    let added_buckets = ((last_bucket_num.saturating_sub(first_bucket_num)).max(0) as u64)
+        .saturating_sub(buckets.len() as u64);
     limits.add_memory_consumed(
-        added_buckets as u64 * std::mem::size_of::<IntermediateHistogramBucketEntry>() as u64,
-    );
-    limits.validate_memory_consumption()?;
+        added_buckets * std::mem::size_of::<IntermediateHistogramBucketEntry>() as u64,
+    )?;
     // create buckets
     let fill_gaps_buckets = generate_buckets_with_opt_minmax(histogram_req, min_max);
 
@@ -410,17 +463,14 @@ fn intermediate_buckets_to_final_buckets_fill_gaps(
 
     // Use merge_join_by to fill in gaps, since buckets are sorted
 
-    buckets
+    let final_buckets: Vec<BucketEntry> = buckets
         .into_iter()
-        .merge_join_by(
-            fill_gaps_buckets.into_iter(),
-            |existing_bucket, fill_gaps_bucket| {
-                existing_bucket
-                    .key
-                    .partial_cmp(fill_gaps_bucket)
-                    .unwrap_or(Ordering::Equal)
-            },
-        )
+        .merge_join_by(fill_gaps_buckets, |existing_bucket, fill_gaps_bucket| {
+            existing_bucket
+                .key
+                .partial_cmp(fill_gaps_bucket)
+                .unwrap_or(Ordering::Equal)
+        })
         .map(|either| match either {
             // Ignore the generated bucket
             itertools::EitherOrBoth::Both(existing, _) => existing,
@@ -435,25 +485,33 @@ fn intermediate_buckets_to_final_buckets_fill_gaps(
         .map(|intermediate_bucket| {
             intermediate_bucket.into_final_bucket_entry(sub_aggregation, limits)
         })
-        .collect::<crate::Result<Vec<_>>>()
+        .collect::<crate::Result<Vec<_>>>()?;
+
+    Ok(final_buckets)
 }
 
 // Convert to BucketEntry
 pub(crate) fn intermediate_histogram_buckets_to_final_buckets(
     buckets: Vec<IntermediateHistogramBucketEntry>,
-    column_type: Option<ColumnType>,
+    is_date_agg: bool,
     histogram_req: &HistogramAggregation,
-    sub_aggregation: &AggregationsInternal,
+    sub_aggregation: &Aggregations,
     limits: &AggregationLimits,
 ) -> crate::Result<Vec<BucketEntry>> {
+    // Normalization is column type dependent.
+    // The request used in the the call to final is not yet be normalized.
+    // Normalization is changing the precision from milliseconds to nanoseconds.
+    let mut histogram_req = histogram_req.clone();
+    if is_date_agg {
+        histogram_req.normalize_date_time();
+    }
     let mut buckets = if histogram_req.min_doc_count() == 0 {
         // With min_doc_count != 0, we may need to add buckets, so that there are no
         // gaps, since intermediate result does not contain empty buckets (filtered to
         // reduce serialization size).
-
         intermediate_buckets_to_final_buckets_fill_gaps(
             buckets,
-            histogram_req,
+            &histogram_req,
             sub_aggregation,
             limits,
         )?
@@ -468,10 +526,12 @@ pub(crate) fn intermediate_histogram_buckets_to_final_buckets(
     };
 
     // If we have a date type on the histogram buckets, we add the `key_as_string` field as rfc339
-    if column_type == Some(ColumnType::DateTime) {
+    // and normalize from nanoseconds to milliseconds
+    if is_date_agg {
         for bucket in buckets.iter_mut() {
-            if let crate::aggregation::Key::F64(val) = bucket.key {
-                let key_as_string = format_date(val as i64)?;
+            if let crate::aggregation::Key::F64(ref mut val) = bucket.key {
+                let key_as_string = format_date(*val as i64)?;
+                *val /= 1_000_000.0;
                 bucket.key_as_string = Some(key_as_string);
             }
         }
@@ -539,14 +599,12 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::aggregation::agg_req::{
-        Aggregation, Aggregations, BucketAggregation, BucketAggregationType, MetricAggregation,
-    };
-    use crate::aggregation::metric::{AverageAggregation, StatsAggregation};
+    use crate::aggregation::agg_result::AggregationResults;
     use crate::aggregation::tests::{
         exec_request, exec_request_with_query, exec_request_with_query_and_memory_limit,
         get_test_index_2_segments, get_test_index_from_values, get_test_index_with_num_docs,
     };
+    use crate::query::AllQuery;
 
     #[test]
     fn histogram_test_crooked_values() -> crate::Result<()> {
@@ -554,20 +612,16 @@ mod tests {
 
         let index = get_test_index_from_values(false, &values)?;
 
-        let agg_req: Aggregations = vec![(
-            "my_interval".to_string(),
-            Aggregation::Bucket(Box::new(BucketAggregation {
-                bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                    field: "score_f64".to_string(),
-                    interval: 3.5,
-                    offset: Some(0.0),
-                    ..Default::default()
-                }),
-                sub_aggregation: Default::default(),
-            })),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_interval": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 3.5,
+                    "offset": 0.0,
+                }
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -580,20 +634,16 @@ mod tests {
         assert_eq!(res["my_interval"]["buckets"][9], Value::Null);
 
         // With offset
-        let agg_req: Aggregations = vec![(
-            "my_interval".to_string(),
-            Aggregation::Bucket(Box::new(BucketAggregation {
-                bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                    field: "score_f64".to_string(),
-                    interval: 3.5,
-                    offset: Some(1.2),
-                    ..Default::default()
-                }),
-                sub_aggregation: Default::default(),
-            })),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_interval": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 3.5,
+                    "offset": 1.2,
+                }
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -629,19 +679,15 @@ mod tests {
 
         let index = get_test_index_from_values(merge_segments, &values)?;
 
-        let agg_req: Aggregations = vec![(
-            "my_interval".to_string(),
-            Aggregation::Bucket(Box::new(BucketAggregation {
-                bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                    field: "score_f64".to_string(),
-                    interval: 1.0,
-                    ..Default::default()
-                }),
-                sub_aggregation: Default::default(),
-            })),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_interval": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 1.0,
+                }
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -664,19 +710,15 @@ mod tests {
     fn histogram_simple_test() -> crate::Result<()> {
         let index = get_test_index_with_num_docs(false, 100)?;
 
-        let agg_req: Aggregations = vec![(
-            "histogram".to_string(),
-            Aggregation::Bucket(Box::new(BucketAggregation {
-                bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                    field: "score_f64".to_string(),
-                    interval: 1.0,
-                    ..Default::default()
-                }),
-                sub_aggregation: Default::default(),
-            })),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "histogram": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 1.0,
+                }
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -694,19 +736,15 @@ mod tests {
     fn histogram_memory_limit() -> crate::Result<()> {
         let index = get_test_index_with_num_docs(true, 100)?;
 
-        let agg_req: Aggregations = vec![(
-            "histogram".to_string(),
-            Aggregation::Bucket(Box::new(BucketAggregation {
-                bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                    field: "score_f64".to_string(),
-                    interval: 0.1,
-                    ..Default::default()
-                }),
-                sub_aggregation: Default::default(),
-            })),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "histogram": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 0.1,
+                }
+            }
+        }))
+        .unwrap();
 
         let res = exec_request_with_query_and_memory_limit(
             agg_req,
@@ -715,11 +753,9 @@ mod tests {
             AggregationLimits::new(Some(5_000), None),
         )
         .unwrap_err();
-        assert_eq!(
-            res.to_string(),
-            "Aborting aggregation because memory limit was exceeded. Limit: 5.00 KB, Current: \
-             102.48 KB"
-        );
+        assert!(res.to_string().starts_with(
+            "Aborting aggregation because memory limit was exceeded. Limit: 5.00 KB, Current"
+        ));
 
         Ok(())
     }
@@ -731,19 +767,15 @@ mod tests {
 
         let index = get_test_index_from_values(false, &values)?;
 
-        let agg_req: Aggregations = vec![(
-            "histogram".to_string(),
-            Aggregation::Bucket(Box::new(BucketAggregation {
-                bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                    field: "score_f64".to_string(),
-                    interval: 1.0,
-                    ..Default::default()
-                }),
-                sub_aggregation: Default::default(),
-            })),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "histogram": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 1.0,
+                }
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -771,20 +803,16 @@ mod tests {
 
         let index = get_test_index_from_values(merge_segments, &values)?;
 
-        let agg_req: Aggregations = vec![(
-            "histogram".to_string(),
-            Aggregation::Bucket(Box::new(BucketAggregation {
-                bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                    field: "score_f64".to_string(),
-                    interval: 1.0,
-                    min_doc_count: Some(2),
-                    ..Default::default()
-                }),
-                sub_aggregation: Default::default(),
-            })),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "histogram": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 1.0,
+                    "min_doc_count": 2,
+                }
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -809,23 +837,19 @@ mod tests {
         let values = vec![5.0];
         let index = get_test_index_from_values(merge_segments, &values)?;
 
-        let agg_req: Aggregations = vec![(
-            "histogram".to_string(),
-            Aggregation::Bucket(Box::new(BucketAggregation {
-                bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                    field: "score_f64".to_string(),
-                    interval: 1.0,
-                    extended_bounds: Some(HistogramBounds {
-                        min: 2.0,
-                        max: 12.0,
-                    }),
-                    ..Default::default()
-                }),
-                sub_aggregation: Default::default(),
-            })),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "histogram": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 1.0,
+                    "extended_bounds": {
+                        "min": 2.0,
+                        "max": 12.0,
+                    },
+                }
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -841,20 +865,19 @@ mod tests {
         let values = vec![5.0, 5.5];
         let index = get_test_index_from_values(merge_segments, &values)?;
 
-        let agg_req: Aggregations = vec![(
-            "histogram".to_string(),
-            Aggregation::Bucket(Box::new(BucketAggregation {
-                bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                    field: "score_f64".to_string(),
-                    interval: 1.0,
-                    extended_bounds: Some(HistogramBounds { min: 3.0, max: 6.0 }),
-                    ..Default::default()
-                }),
-                sub_aggregation: Default::default(),
-            })),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "histogram": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 1.0,
+                    "extended_bounds": {
+                        "min": 3.0,
+                        "max": 6.0,
+                    },
+                }
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -872,21 +895,23 @@ mod tests {
         let values = vec![15.0];
         let index = get_test_index_from_values(merge_segments, &values)?;
 
-        let agg_req: Aggregations = vec![(
-            "histogram".to_string(),
-            Aggregation::Bucket(Box::new(BucketAggregation {
-                bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                    field: "score_f64".to_string(),
-                    interval: 1.0,
-                    extended_bounds: Some(HistogramBounds { min: 3.0, max: 6.0 }),
-                    hard_bounds: Some(HistogramBounds { min: 3.0, max: 6.0 }),
-                    ..Default::default()
-                }),
-                sub_aggregation: Default::default(),
-            })),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "histogram": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 1.0,
+                    "extended_bounds": {
+                        "min": 3.0,
+                        "max": 6.0,
+                    },
+                    "hard_bounds": {
+                        "min": 3.0,
+                        "max": 6.0,
+                    },
+                }
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -916,26 +941,19 @@ mod tests {
 
         let index = get_test_index_from_values(merge_segments, &values)?;
 
-        let agg_req: Aggregations = vec![(
-            "histogram".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                        field: "score_f64".to_string(),
-                        interval: 1.0,
-                        hard_bounds: Some(HistogramBounds {
-                            min: 2.0,
-                            max: 12.0,
-                        }),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "histogram": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 1.0,
+                    "hard_bounds": {
+                        "min": 2.0,
+                        "max": 12.0,
+                    },
                 }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -950,30 +968,23 @@ mod tests {
 
         // hard_bounds and extended_bounds will act like a force bounds
         //
-        let agg_req: Aggregations = vec![(
-            "histogram".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                        field: "score_f64".to_string(),
-                        interval: 1.0,
-                        hard_bounds: Some(HistogramBounds {
-                            min: 2.0,
-                            max: 12.0,
-                        }),
-                        extended_bounds: Some(HistogramBounds {
-                            min: 2.0,
-                            max: 12.0,
-                        }),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "histogram": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 1.0,
+                    "extended_bounds": {
+                        "min": 2.0,
+                        "max": 12.0,
+                    },
+                    "hard_bounds": {
+                        "min": 2.0,
+                        "max": 12.0,
+                    },
                 }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -986,31 +997,24 @@ mod tests {
 
         assert_eq!(res["histogram"]["buckets"][11], Value::Null);
 
-        // Invalid request
-        let agg_req: Aggregations = vec![(
-            "histogram".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                        field: "score_f64".to_string(),
-                        interval: 1.0,
-                        hard_bounds: Some(HistogramBounds {
-                            min: 2.0,
-                            max: 12.0,
-                        }),
-                        extended_bounds: Some(HistogramBounds {
-                            min: 1.0,
-                            max: 12.0,
-                        }),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
+        // invalid request
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "histogram": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 1.0,
+                    "extended_bounds": {
+                        "min": 1.0,
+                        "max": 12.0,
+                    },
+                    "hard_bounds": {
+                        "min": 2.0,
+                        "max": 12.0,
+                    },
                 }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index).unwrap_err();
         assert_eq!(
@@ -1035,22 +1039,15 @@ mod tests {
     fn histogram_empty_result_behaviour_test_with_opt(merge_segments: bool) -> crate::Result<()> {
         let index = get_test_index_2_segments(merge_segments)?;
 
-        let agg_req: Aggregations = vec![(
-            "histogram".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                        field: "score_f64".to_string(),
-                        interval: 1.0,
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "histogram": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 1.0,
                 }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+            }
+        }))
+        .unwrap();
 
         let res = exec_request_with_query(agg_req.clone(), &index, Some(("text", "blubberasdf")))?;
 
@@ -1086,26 +1083,19 @@ mod tests {
         // Don't merge empty segments
         let index = get_test_index_from_values(false, &values)?;
 
-        let agg_req: Aggregations = vec![(
-            "histogram".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                        field: "score_f64".to_string(),
-                        interval: 1.0,
-                        extended_bounds: Some(HistogramBounds {
-                            min: 2.0,
-                            max: 12.0,
-                        }),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "histogram": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 1.0,
+                    "extended_bounds": {
+                        "min": 2.0,
+                        "max": 12.0,
+                    },
                 }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -1117,27 +1107,24 @@ mod tests {
         assert_eq!(res["histogram"]["buckets"][10]["key"], 12.0);
         assert_eq!(res["histogram"]["buckets"][10]["doc_count"], 0);
 
-        let agg_req: Aggregations = vec![(
-            "histogram".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                        field: "score_f64".to_string(),
-                        interval: 1.0,
-                        extended_bounds: Some(HistogramBounds { min: 2.0, max: 5.0 }),
-                        hard_bounds: Some(HistogramBounds {
-                            min: 2.0,
-                            max: 12.0,
-                        }),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "histogram": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 1.0,
+                    "extended_bounds": {
+                        "min": 2.0,
+                        "max": 5.0,
+                    },
+                    "hard_bounds": {
+                        "min": 2.0,
+                        "max": 12.0,
+                    },
+
                 }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -1149,26 +1136,20 @@ mod tests {
         assert_eq!(res["histogram"]["buckets"][10], Value::Null);
 
         // hard_bounds will not extend the result
-        let agg_req: Aggregations = vec![(
-            "histogram".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                        field: "score_f64".to_string(),
-                        interval: 1.0,
-                        hard_bounds: Some(HistogramBounds {
-                            min: 2.0,
-                            max: 12.0,
-                        }),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "histogram": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 1.0,
+                    "hard_bounds": {
+                        "min": 2.0,
+                        "max": 12.0,
+                    },
+
                 }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -1181,43 +1162,27 @@ mod tests {
             })
         );
 
-        let agg_req: Aggregations = vec![
-            (
-                "stats".to_string(),
-                Aggregation::Metric(MetricAggregation::Stats(StatsAggregation {
-                    field: "score_f64".to_string(),
-                })),
-            ),
-            (
-                "avg".to_string(),
-                Aggregation::Metric(MetricAggregation::Average(AverageAggregation {
-                    field: "score_f64".to_string(),
-                })),
-            ),
-        ]
-        .into_iter()
-        .collect();
+        let sub_agg_req: Aggregations = serde_json::from_value(json!({
+            "stats": { "stats": { "field": "score_f64", } },
+            "avg": { "avg": { "field": "score_f64", } }
 
-        let agg_req: Aggregations = vec![(
-            "histogram".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                        field: "score_f64".to_string(),
-                        interval: 1.0,
-                        extended_bounds: Some(HistogramBounds {
-                            min: 2.0,
-                            max: 12.0,
-                        }),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: agg_req,
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        }))
+        .unwrap();
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "histogram": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 1.0,
+                    "extended_bounds": {
+                        "min": 2.0,
+                        "max": 12.0,
+                    },
+                },
+                "aggs": sub_agg_req
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -1262,22 +1227,15 @@ mod tests {
     fn histogram_single_bucket_test_with_opt(merge_segments: bool) -> crate::Result<()> {
         let index = get_test_index_2_segments(merge_segments)?;
 
-        let agg_req: Aggregations = vec![(
-            "histogram".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                        field: "score_f64".to_string(),
-                        interval: 100000.0,
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "histogram": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 100000.0,
+                },
+            }
+        }))
+        .unwrap();
 
         let agg_res = exec_request(agg_req, &index)?;
 
@@ -1303,35 +1261,28 @@ mod tests {
     fn histogram_date_test_with_opt(merge_segments: bool) -> crate::Result<()> {
         let index = get_test_index_2_segments(merge_segments)?;
 
-        let agg_req: Aggregations = vec![(
-            "histogram".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                        field: "date".to_string(),
-                        interval: 86400000000.0, // one day in microseconds
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "histogram": {
+                "histogram": {
+                    "field": "date",
+                    "interval": 86400000.0, // one day in milliseconds seconds
+                },
+            }
+        }))
+        .unwrap();
 
         let agg_res = exec_request(agg_req, &index)?;
 
         let res: Value = serde_json::from_str(&serde_json::to_string(&agg_res)?)?;
 
-        assert_eq!(res["histogram"]["buckets"][0]["key"], 1546300800000000.0);
+        assert_eq!(res["histogram"]["buckets"][0]["key"], 1546300800000.0);
         assert_eq!(
             res["histogram"]["buckets"][0]["key_as_string"],
             "2019-01-01T00:00:00Z"
         );
         assert_eq!(res["histogram"]["buckets"][0]["doc_count"], 1);
 
-        assert_eq!(res["histogram"]["buckets"][1]["key"], 1546387200000000.0);
+        assert_eq!(res["histogram"]["buckets"][1]["key"], 1546387200000.0);
         assert_eq!(
             res["histogram"]["buckets"][1]["key_as_string"],
             "2019-01-02T00:00:00Z"
@@ -1339,7 +1290,7 @@ mod tests {
 
         assert_eq!(res["histogram"]["buckets"][1]["doc_count"], 5);
 
-        assert_eq!(res["histogram"]["buckets"][2]["key"], 1546473600000000.0);
+        assert_eq!(res["histogram"]["buckets"][2]["key"], 1546473600000.0);
         assert_eq!(
             res["histogram"]["buckets"][2]["key_as_string"],
             "2019-01-03T00:00:00Z"
@@ -1354,22 +1305,15 @@ mod tests {
     fn histogram_invalid_request() -> crate::Result<()> {
         let index = get_test_index_2_segments(true)?;
 
-        let agg_req: Aggregations = vec![(
-            "histogram".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                        field: "score_f64".to_string(),
-                        interval: 0.0,
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "histogram": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 0.0,
+                },
+            }
+        }))
+        .unwrap();
 
         let agg_res = exec_request(agg_req, &index);
 
@@ -1381,24 +1325,16 @@ mod tests {
     #[test]
     fn histogram_keyed_buckets_test() -> crate::Result<()> {
         let index = get_test_index_with_num_docs(false, 100)?;
-
-        let agg_req: Aggregations = vec![(
-            "histogram".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Histogram(HistogramAggregation {
-                        field: "score_f64".to_string(),
-                        interval: 50.0,
-                        keyed: true,
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "histogram": {
+                "histogram": {
+                    "field": "score_f64",
+                    "interval": 50.0,
+                    "keyed": true
+                },
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -1419,6 +1355,35 @@ mod tests {
                 }
             })
         );
+
+        Ok(())
+    }
+    #[test]
+    fn test_aggregation_histogram_empty_index() -> crate::Result<()> {
+        // test index without segments
+        let values = vec![];
+
+        let index = get_test_index_from_values(false, &values)?;
+
+        let agg_req_1: Aggregations = serde_json::from_value(json!({
+            "myhisto": {
+                "histogram": {
+                    "field": "score",
+                    "interval": 10.0
+                },
+            }
+        }))
+        .unwrap();
+
+        let collector = AggregationCollector::from_aggs(agg_req_1, Default::default());
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let agg_res: AggregationResults = searcher.search(&AllQuery, &collector).unwrap();
+
+        let res: Value = serde_json::from_str(&serde_json::to_string(&agg_res)?)?;
+        // Make sure the result structure is correct
+        assert_eq!(res["myhisto"]["buckets"].as_array().unwrap().len(), 0);
 
         Ok(())
     }

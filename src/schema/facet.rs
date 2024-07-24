@@ -131,16 +131,16 @@ impl Facet {
     pub fn from_path<Path>(path: Path) -> Facet
     where
         Path: IntoIterator,
-        Path::Item: ToString,
+        Path::Item: AsRef<str>,
     {
         let mut facet_string: String = String::with_capacity(100);
         let mut step_it = path.into_iter();
         if let Some(step) = step_it.next() {
-            facet_string.push_str(&step.to_string());
+            facet_string.push_str(step.as_ref());
         }
         for step in step_it {
             facet_string.push(FACET_SEP_CHAR);
-            facet_string.push_str(&step.to_string());
+            facet_string.push_str(step.as_ref());
         }
         Facet(facet_string)
     }
@@ -174,7 +174,7 @@ impl Facet {
 
     /// This function is the inverse of Facet::from(&str).
     pub fn to_path_string(&self) -> String {
-        format!("{}", self)
+        format!("{self}")
     }
 }
 
@@ -233,7 +233,7 @@ impl<'de> Deserialize<'de> for Facet {
 
 impl Debug for Facet {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "Facet({})", self)?;
+        write!(f, "Facet({self})")?;
         Ok(())
     }
 }
@@ -264,12 +264,12 @@ mod tests {
         {
             let v = ["first", "second", "third"];
             let facet = Facet::from_path(v.iter());
-            assert_eq!(format!("{}", facet), "/first/second/third");
+            assert_eq!(format!("{facet}"), "/first/second/third");
         }
         {
             let v = ["first", "sec/ond", "third"];
             let facet = Facet::from_path(v.iter());
-            assert_eq!(format!("{}", facet), "/first/sec\\/ond/third");
+            assert_eq!(format!("{facet}"), "/first/sec\\/ond/third");
         }
     }
 
@@ -277,7 +277,7 @@ mod tests {
     fn test_facet_debug() {
         let v = ["first", "second", "third"];
         let facet = Facet::from_path(v.iter());
-        assert_eq!(format!("{:?}", facet), "Facet(/first/second/third)");
+        assert_eq!(format!("{facet:?}"), "Facet(/first/second/third)");
     }
 
     #[test]

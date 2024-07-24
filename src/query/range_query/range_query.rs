@@ -1,19 +1,17 @@
 use std::io;
-use std::ops::{Bound, Range};
+use std::ops::Bound;
 
-use common::{BinarySerializable, BitSet};
+use common::BitSet;
 
 use super::map_bound;
 use super::range_query_u64_fastfield::FastFieldRangeWeight;
-use crate::core::SegmentReader;
-use crate::error::TantivyError;
+use crate::index::SegmentReader;
 use crate::query::explanation::does_not_match;
 use crate::query::range_query::is_type_valid_for_fastfield_range_query;
-use crate::query::range_query::range_query_ip_fastfield::IPFastFieldRangeWeight;
 use crate::query::{BitSetDocSet, ConstScorer, EnableScoring, Explanation, Query, Scorer, Weight};
 use crate::schema::{Field, IndexRecordOption, Term, Type};
 use crate::termdict::{TermDictionary, TermStreamer};
-use crate::{DateTime, DocId, Score};
+use crate::{DocId, Score};
 
 /// `RangeQuery` matches all documents that have at least one term within a defined range.
 ///
@@ -38,15 +36,17 @@ use crate::{DateTime, DocId, Score};
 /// ```rust
 /// use tantivy::collector::Count;
 /// use tantivy::query::RangeQuery;
+/// use tantivy::Term;
 /// use tantivy::schema::{Schema, INDEXED};
-/// use tantivy::{doc, Index};
+/// use tantivy::{doc, Index, IndexWriter};
+/// use std::ops::Bound;
 /// # fn test() -> tantivy::Result<()> {
 /// let mut schema_builder = Schema::builder();
 /// let year_field = schema_builder.add_u64_field("year", INDEXED);
 /// let schema = schema_builder.build();
 ///
 /// let index = Index::create_in_ram(schema);
-/// let mut index_writer = index.writer_with_num_threads(1, 10_000_000)?;
+/// let mut index_writer: IndexWriter = index.writer_with_num_threads(1, 20_000_000)?;
 /// for year in 1950u64..2017u64 {
 ///     let num_docs_within_year = 10 + (year - 1950) * (year - 1950);
 ///     for _ in 0..num_docs_within_year {
@@ -57,7 +57,10 @@ use crate::{DateTime, DocId, Score};
 ///
 /// let reader = index.reader()?;
 /// let searcher = reader.searcher();
-/// let docs_in_the_sixties = RangeQuery::new_u64("year".to_string(), 1960..1970);
+/// let docs_in_the_sixties = RangeQuery::new(
+///     Bound::Included(Term::from_field_u64(year_field, 1960)),
+///     Bound::Excluded(Term::from_field_u64(year_field, 1970)),
+/// );
 /// let num_60s_books = searcher.search(&docs_in_the_sixties, &Count)?;
 /// assert_eq!(num_60s_books, 2285);
 /// Ok(())
@@ -66,11 +69,17 @@ use crate::{DateTime, DocId, Score};
 /// ```
 #[derive(Clone, Debug)]
 pub struct RangeQuery {
-    field: String,
-    value_type: Type,
-    left_bound: Bound<Vec<u8>>,
-    right_bound: Bound<Vec<u8>>,
+    lower_bound: Bound<Term>,
+    upper_bound: Bound<Term>,
     limit: Option<u64>,
+}
+
+/// Returns the inner value of a `Bound`
+pub(crate) fn inner_bound(val: &Bound<Term>) -> Option<&Term> {
+    match val {
+        Bound::Included(term) | Bound::Excluded(term) => Some(term),
+        Bound::Unbounded => None,
+    }
 }
 
 impl RangeQuery {
@@ -78,207 +87,28 @@ impl RangeQuery {
     ///
     /// If the value type is not correct, something may go terribly wrong when
     /// the `Weight` object is created.
-    pub fn new_term_bounds(
-        field: String,
-        value_type: Type,
-        left_bound: &Bound<Term>,
-        right_bound: &Bound<Term>,
-    ) -> RangeQuery {
-        let verify_and_unwrap_term = |val: &Term| val.value_bytes().to_owned();
+    pub fn new(lower_bound: Bound<Term>, upper_bound: Bound<Term>) -> RangeQuery {
         RangeQuery {
-            field,
-            value_type,
-            left_bound: map_bound(left_bound, &verify_and_unwrap_term),
-            right_bound: map_bound(right_bound, &verify_and_unwrap_term),
+            lower_bound,
+            upper_bound,
             limit: None,
         }
-    }
-
-    /// Creates a new `RangeQuery` over a `i64` field.
-    ///
-    /// If the field is not of the type `i64`, tantivy
-    /// will panic when the `Weight` object is created.
-    pub fn new_i64(field: String, range: Range<i64>) -> RangeQuery {
-        RangeQuery::new_i64_bounds(
-            field,
-            Bound::Included(range.start),
-            Bound::Excluded(range.end),
-        )
-    }
-
-    /// Create a new `RangeQuery` over a `i64` field.
-    ///
-    /// The two `Bound` arguments make it possible to create more complex
-    /// ranges than semi-inclusive range.
-    ///
-    /// If the field is not of the type `i64`, tantivy
-    /// will panic when the `Weight` object is created.
-    pub fn new_i64_bounds(
-        field: String,
-        left_bound: Bound<i64>,
-        right_bound: Bound<i64>,
-    ) -> RangeQuery {
-        let make_term_val = |val: &i64| {
-            Term::from_field_i64(Field::from_field_id(0), *val)
-                .value_bytes()
-                .to_owned()
-        };
-        RangeQuery {
-            field,
-            value_type: Type::I64,
-            left_bound: map_bound(&left_bound, &make_term_val),
-            right_bound: map_bound(&right_bound, &make_term_val),
-            limit: None,
-        }
-    }
-
-    /// Creates a new `RangeQuery` over a `f64` field.
-    ///
-    /// If the field is not of the type `f64`, tantivy
-    /// will panic when the `Weight` object is created.
-    pub fn new_f64(field: String, range: Range<f64>) -> RangeQuery {
-        RangeQuery::new_f64_bounds(
-            field,
-            Bound::Included(range.start),
-            Bound::Excluded(range.end),
-        )
-    }
-
-    /// Create a new `RangeQuery` over a `f64` field.
-    ///
-    /// The two `Bound` arguments make it possible to create more complex
-    /// ranges than semi-inclusive range.
-    ///
-    /// If the field is not of the type `f64`, tantivy
-    /// will panic when the `Weight` object is created.
-    pub fn new_f64_bounds(
-        field: String,
-        left_bound: Bound<f64>,
-        right_bound: Bound<f64>,
-    ) -> RangeQuery {
-        let make_term_val = |val: &f64| {
-            Term::from_field_f64(Field::from_field_id(0), *val)
-                .value_bytes()
-                .to_owned()
-        };
-        RangeQuery {
-            field,
-            value_type: Type::F64,
-            left_bound: map_bound(&left_bound, &make_term_val),
-            right_bound: map_bound(&right_bound, &make_term_val),
-            limit: None,
-        }
-    }
-
-    /// Create a new `RangeQuery` over a `u64` field.
-    ///
-    /// The two `Bound` arguments make it possible to create more complex
-    /// ranges than semi-inclusive range.
-    ///
-    /// If the field is not of the type `u64`, tantivy
-    /// will panic when the `Weight` object is created.
-    pub fn new_u64_bounds(
-        field: String,
-        left_bound: Bound<u64>,
-        right_bound: Bound<u64>,
-    ) -> RangeQuery {
-        let make_term_val = |val: &u64| {
-            Term::from_field_u64(Field::from_field_id(0), *val)
-                .value_bytes()
-                .to_owned()
-        };
-        RangeQuery {
-            field,
-            value_type: Type::U64,
-            left_bound: map_bound(&left_bound, &make_term_val),
-            right_bound: map_bound(&right_bound, &make_term_val),
-            limit: None,
-        }
-    }
-
-    /// Create a new `RangeQuery` over a `u64` field.
-    ///
-    /// If the field is not of the type `u64`, tantivy
-    /// will panic when the `Weight` object is created.
-    pub fn new_u64(field: String, range: Range<u64>) -> RangeQuery {
-        RangeQuery::new_u64_bounds(
-            field,
-            Bound::Included(range.start),
-            Bound::Excluded(range.end),
-        )
-    }
-
-    /// Create a new `RangeQuery` over a `date` field.
-    ///
-    /// The two `Bound` arguments make it possible to create more complex
-    /// ranges than semi-inclusive range.
-    ///
-    /// If the field is not of the type `date`, tantivy
-    /// will panic when the `Weight` object is created.
-    pub fn new_date_bounds(
-        field: String,
-        left_bound: Bound<DateTime>,
-        right_bound: Bound<DateTime>,
-    ) -> RangeQuery {
-        let make_term_val = |val: &DateTime| {
-            Term::from_field_date(Field::from_field_id(0), *val)
-                .value_bytes()
-                .to_owned()
-        };
-        RangeQuery {
-            field,
-            value_type: Type::Date,
-            left_bound: map_bound(&left_bound, &make_term_val),
-            right_bound: map_bound(&right_bound, &make_term_val),
-            limit: None,
-        }
-    }
-
-    /// Create a new `RangeQuery` over a `date` field.
-    ///
-    /// If the field is not of the type `date`, tantivy
-    /// will panic when the `Weight` object is created.
-    pub fn new_date(field: String, range: Range<DateTime>) -> RangeQuery {
-        RangeQuery::new_date_bounds(
-            field,
-            Bound::Included(range.start),
-            Bound::Excluded(range.end),
-        )
-    }
-
-    /// Create a new `RangeQuery` over a `Str` field.
-    ///
-    /// The two `Bound` arguments make it possible to create more complex
-    /// ranges than semi-inclusive range.
-    ///
-    /// If the field is not of the type `Str`, tantivy
-    /// will panic when the `Weight` object is created.
-    pub fn new_str_bounds(field: String, left: Bound<&str>, right: Bound<&str>) -> RangeQuery {
-        let make_term_val = |val: &&str| val.as_bytes().to_vec();
-        RangeQuery {
-            field,
-            value_type: Type::Str,
-            left_bound: map_bound(&left, &make_term_val),
-            right_bound: map_bound(&right, &make_term_val),
-            limit: None,
-        }
-    }
-
-    /// Create a new `RangeQuery` over a `Str` field.
-    ///
-    /// If the field is not of the type `Str`, tantivy
-    /// will panic when the `Weight` object is created.
-    pub fn new_str(field: String, range: Range<&str>) -> RangeQuery {
-        RangeQuery::new_str_bounds(
-            field,
-            Bound::Included(range.start),
-            Bound::Excluded(range.end),
-        )
     }
 
     /// Field to search over
-    pub fn field(&self) -> &str {
-        &self.field
+    pub fn field(&self) -> Field {
+        self.get_term().field()
+    }
+
+    /// The value type of the field
+    pub fn value_type(&self) -> Type {
+        self.get_term().typ()
+    }
+
+    pub(crate) fn get_term(&self) -> &Term {
+        inner_bound(&self.lower_bound)
+            .or(inner_bound(&self.upper_bound))
+            .expect("At least one bound must be set")
     }
 
     /// Limit the number of term the `RangeQuery` will go through.
@@ -290,58 +120,23 @@ impl RangeQuery {
     }
 }
 
-/// Returns true if the type maps to a u64 fast field
-pub(crate) fn maps_to_u64_fastfield(typ: Type) -> bool {
-    match typ {
-        Type::U64 | Type::I64 | Type::F64 | Type::Bool | Type::Date => true,
-        Type::IpAddr => false,
-        Type::Str | Type::Facet | Type::Bytes | Type::Json => false,
-    }
-}
-
 impl Query for RangeQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         let schema = enable_scoring.schema();
-        let field_type = schema
-            .get_field_entry(schema.get_field(&self.field)?)
-            .field_type();
-        let value_type = field_type.value_type();
-        if value_type != self.value_type {
-            let err_msg = format!(
-                "Create a range query of the type {:?}, when the field given was of type {:?}",
-                self.value_type, value_type
-            );
-            return Err(TantivyError::SchemaError(err_msg));
-        }
+        let field_type = schema.get_field_entry(self.field()).field_type();
 
-        if field_type.is_fast() && is_type_valid_for_fastfield_range_query(self.value_type) {
-            if field_type.is_ip_addr() {
-                Ok(Box::new(IPFastFieldRangeWeight::new(
-                    self.field.to_string(),
-                    &self.left_bound,
-                    &self.right_bound,
-                )))
-            } else {
-                // We run the range query on u64 value space for performance reasons and simpicity
-                // assert the type maps to u64
-                assert!(maps_to_u64_fastfield(self.value_type));
-                let parse_from_bytes = |data: &Vec<u8>| {
-                    u64::from_be(BinarySerializable::deserialize(&mut &data[..]).unwrap())
-                };
-
-                let left_bound = map_bound(&self.left_bound, &parse_from_bytes);
-                let right_bound = map_bound(&self.right_bound, &parse_from_bytes);
-                Ok(Box::new(FastFieldRangeWeight::new(
-                    self.field.to_string(),
-                    left_bound,
-                    right_bound,
-                )))
-            }
+        if field_type.is_fast() && is_type_valid_for_fastfield_range_query(self.value_type()) {
+            Ok(Box::new(FastFieldRangeWeight::new(
+                self.field(),
+                self.lower_bound.clone(),
+                self.upper_bound.clone(),
+            )))
         } else {
+            let verify_and_unwrap_term = |val: &Term| val.serialized_value_bytes().to_owned();
             Ok(Box::new(RangeWeight {
-                field: self.field.to_string(),
-                left_bound: self.left_bound.clone(),
-                right_bound: self.right_bound.clone(),
+                field: self.field(),
+                lower_bound: map_bound(&self.lower_bound, verify_and_unwrap_term),
+                upper_bound: map_bound(&self.upper_bound, verify_and_unwrap_term),
                 limit: self.limit,
             }))
         }
@@ -349,9 +144,9 @@ impl Query for RangeQuery {
 }
 
 pub struct RangeWeight {
-    field: String,
-    left_bound: Bound<Vec<u8>>,
-    right_bound: Bound<Vec<u8>>,
+    field: Field,
+    lower_bound: Bound<Vec<u8>>,
+    upper_bound: Bound<Vec<u8>>,
     limit: Option<u64>,
 }
 
@@ -359,12 +154,12 @@ impl RangeWeight {
     fn term_range<'a>(&self, term_dict: &'a TermDictionary) -> io::Result<TermStreamer<'a>> {
         use std::ops::Bound::*;
         let mut term_stream_builder = term_dict.range();
-        term_stream_builder = match self.left_bound {
+        term_stream_builder = match self.lower_bound {
             Included(ref term_val) => term_stream_builder.ge(term_val),
             Excluded(ref term_val) => term_stream_builder.gt(term_val),
             Unbounded => term_stream_builder,
         };
-        term_stream_builder = match self.right_bound {
+        term_stream_builder = match self.upper_bound {
             Included(ref term_val) => term_stream_builder.le(term_val),
             Excluded(ref term_val) => term_stream_builder.lt(term_val),
             Unbounded => term_stream_builder,
@@ -382,7 +177,7 @@ impl Weight for RangeWeight {
         let max_doc = reader.max_doc();
         let mut doc_bitset = BitSet::with_max_value(max_doc);
 
-        let inverted_index = reader.inverted_index(reader.schema().get_field(&self.field)?)?;
+        let inverted_index = reader.inverted_index(self.field)?;
         let term_dict = inverted_index.terms();
         let mut term_range = self.term_range(term_dict)?;
         let mut processed_count = 0;
@@ -431,9 +226,12 @@ mod tests {
 
     use super::RangeQuery;
     use crate::collector::{Count, TopDocs};
+    use crate::indexer::NoMergePolicy;
     use crate::query::QueryParser;
-    use crate::schema::{Document, Field, IntoIpv6Addr, Schema, FAST, INDEXED, STORED, TEXT};
-    use crate::{doc, Index};
+    use crate::schema::{
+        Field, IntoIpv6Addr, Schema, TantivyDocument, FAST, INDEXED, STORED, TEXT,
+    };
+    use crate::{Index, IndexWriter, Term};
 
     #[test]
     fn test_range_query_simple() -> crate::Result<()> {
@@ -455,7 +253,10 @@ mod tests {
         let reader = index.reader()?;
         let searcher = reader.searcher();
 
-        let docs_in_the_sixties = RangeQuery::new_u64("year".to_string(), 1960u64..1970u64);
+        let docs_in_the_sixties = RangeQuery::new(
+            Bound::Included(Term::from_field_u64(year_field, 1960)),
+            Bound::Excluded(Term::from_field_u64(year_field, 1970)),
+        );
 
         // ... or `1960..=1969` if inclusive range is enabled.
         let count = searcher.search(&docs_in_the_sixties, &Count)?;
@@ -486,7 +287,10 @@ mod tests {
         let reader = index.reader()?;
         let searcher = reader.searcher();
 
-        let mut docs_in_the_sixties = RangeQuery::new_u64("year".to_string(), 1960u64..1970u64);
+        let mut docs_in_the_sixties = RangeQuery::new(
+            Bound::Included(Term::from_field_u64(year_field, 1960)),
+            Bound::Excluded(Term::from_field_u64(year_field, 1970)),
+        );
         docs_in_the_sixties.limit(5);
 
         // due to the limit and no docs in 1963, it's really only 1960..=1965
@@ -506,16 +310,20 @@ mod tests {
 
         let index = Index::create_in_ram(schema);
         {
-            let mut index_writer = index.writer_with_num_threads(2, 60_000_000)?;
+            let mut index_writer = index.writer_with_num_threads(1, 60_000_000)?;
+            index_writer.set_merge_policy(Box::new(NoMergePolicy));
 
             for i in 1..100 {
-                let mut doc = Document::new();
+                let mut doc = TantivyDocument::new();
                 for j in 1..100 {
                     if i % j == 0 {
                         doc.add_i64(int_field, j as i64);
                     }
                 }
                 index_writer.add_document(doc)?;
+                if i == 10 {
+                    index_writer.commit()?;
+                }
             }
 
             index_writer.commit()?;
@@ -527,29 +335,29 @@ mod tests {
             |range_query: RangeQuery| searcher.search(&range_query, &Count).unwrap();
 
         assert_eq!(
-            count_multiples(RangeQuery::new_i64("intfield".to_string(), 10..11)),
+            count_multiples(RangeQuery::new(
+                Bound::Included(Term::from_field_i64(int_field, 10)),
+                Bound::Excluded(Term::from_field_i64(int_field, 11)),
+            )),
             9
         );
         assert_eq!(
-            count_multiples(RangeQuery::new_i64_bounds(
-                "intfield".to_string(),
-                Bound::Included(10),
-                Bound::Included(11)
+            count_multiples(RangeQuery::new(
+                Bound::Included(Term::from_field_i64(int_field, 10)),
+                Bound::Included(Term::from_field_i64(int_field, 11)),
             )),
             18
         );
         assert_eq!(
-            count_multiples(RangeQuery::new_i64_bounds(
-                "intfield".to_string(),
-                Bound::Excluded(9),
-                Bound::Included(10)
+            count_multiples(RangeQuery::new(
+                Bound::Excluded(Term::from_field_i64(int_field, 9)),
+                Bound::Included(Term::from_field_i64(int_field, 10)),
             )),
             9
         );
         assert_eq!(
-            count_multiples(RangeQuery::new_i64_bounds(
-                "intfield".to_string(),
-                Bound::Included(9),
+            count_multiples(RangeQuery::new(
+                Bound::Included(Term::from_field_i64(int_field, 9)),
                 Bound::Unbounded
             )),
             91
@@ -571,7 +379,7 @@ mod tests {
             let mut index_writer = index.writer_with_num_threads(1, 60_000_000).unwrap();
             let mut docs = Vec::new();
             for i in 1..100 {
-                let mut doc = Document::new();
+                let mut doc = TantivyDocument::new();
                 for j in 1..100 {
                     if i % j == 0 {
                         doc.add_f64(float_field, j as f64);
@@ -598,29 +406,29 @@ mod tests {
             |range_query: RangeQuery| searcher.search(&range_query, &Count).unwrap();
 
         assert_eq!(
-            count_multiples(RangeQuery::new_f64("floatfield".to_string(), 10.0..11.0)),
+            count_multiples(RangeQuery::new(
+                Bound::Included(Term::from_field_f64(float_field, 10.0)),
+                Bound::Excluded(Term::from_field_f64(float_field, 11.0)),
+            )),
             9
         );
         assert_eq!(
-            count_multiples(RangeQuery::new_f64_bounds(
-                "floatfield".to_string(),
-                Bound::Included(10.0),
-                Bound::Included(11.0)
+            count_multiples(RangeQuery::new(
+                Bound::Included(Term::from_field_f64(float_field, 10.0)),
+                Bound::Included(Term::from_field_f64(float_field, 11.0)),
             )),
             18
         );
         assert_eq!(
-            count_multiples(RangeQuery::new_f64_bounds(
-                "floatfield".to_string(),
-                Bound::Excluded(9.0),
-                Bound::Included(10.0)
+            count_multiples(RangeQuery::new(
+                Bound::Excluded(Term::from_field_f64(float_field, 9.0)),
+                Bound::Included(Term::from_field_f64(float_field, 10.0)),
             )),
             9
         );
         assert_eq!(
-            count_multiples(RangeQuery::new_f64_bounds(
-                "floatfield".to_string(),
-                Bound::Included(9.0),
+            count_multiples(RangeQuery::new(
+                Bound::Included(Term::from_field_f64(float_field, 9.0)),
                 Bound::Unbounded
             )),
             91
@@ -676,7 +484,7 @@ mod tests {
         let ip_addr_2 = IpAddr::from_str("127.0.0.20").unwrap().into_ipv6_addr();
 
         {
-            let mut index_writer = index.writer_for_tests().unwrap();
+            let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
             for _ in 0..1_000 {
                 index_writer
                     .add_document(doc!(
