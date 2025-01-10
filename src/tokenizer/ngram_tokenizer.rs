@@ -159,7 +159,7 @@ impl Tokenizer for NgramTokenizer {
     }
 }
 
-impl<'a> TokenStream for NgramTokenStream<'a> {
+impl TokenStream for NgramTokenStream<'_> {
     fn advance(&mut self) -> bool {
         if let Some((offset_from, offset_to)) = self.ngram_charidx_iterator.next() {
             if self.prefix_only && offset_from > 0 {
@@ -192,7 +192,7 @@ impl<'a> TokenStream for NgramTokenStream<'a> {
 /// The elements are emitted in the order of appearance
 /// of `a` first, `b` then.
 ///
-/// See `test_stutterring_iterator` for an example of its
+/// See `test_stuttering_iterator` for an example of its
 /// output.
 struct StutteringIterator<T> {
     underlying: T,
@@ -283,7 +283,7 @@ impl<'a> CodepointFrontiers<'a> {
     }
 }
 
-impl<'a> Iterator for CodepointFrontiers<'a> {
+impl Iterator for CodepointFrontiers<'_> {
     type Item = usize;
 
     fn next(&mut self) -> Option<usize> {
@@ -461,14 +461,14 @@ mod tests {
     }
 
     #[test]
-    fn test_stutterring_iterator_empty() {
+    fn test_stuttering_iterator_empty() {
         let rg: Vec<usize> = vec![0];
         let mut it = StutteringIterator::new(rg.into_iter(), 1, 2);
         assert_eq!(it.next(), None);
     }
 
     #[test]
-    fn test_stutterring_iterator() {
+    fn test_stuterring_iterator() {
         let mut it = StutteringIterator::new(0..10, 1, 2);
         assert_eq!(it.next(), Some((0, 1)));
         assert_eq!(it.next(), Some((0, 2)));

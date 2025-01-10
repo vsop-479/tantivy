@@ -11,7 +11,7 @@ repository = "https://github.com/quickwit-oss/tantivy"
 readme = "README.md"
 keywords = ["search", "information", "retrieval"]
 edition = "2021"
-rust-version = "1.66"
+rust-version = "1.75"
 exclude = ["benches/*.json", "benches/*.txt"]
 
 [dependencies]
@@ -29,7 +29,7 @@ tantivy-fst = "0.5"
 memmap2 = { version = "0.9.0", optional = true }
 lz4_flex = { version = "0.11", default-features = false, optional = true }
 zstd = { version = "0.13", optional = true, default-features = false }
-tempfile = { version = "3.3.0", optional = true }
+tempfile = { version = "3.12.0", optional = true }
 log = "0.4.16"
 serde = { version = "1.0.136", features = ["derive"] }
 serde_json = "1.0.79"
@@ -43,18 +43,19 @@ bitpacking = { version = "0.9.2", default-features = false, features = [
     "bitpacker4x",
 ] }
 census = "0.4.2"
-rustc-hash = "1.1.0"
-thiserror = "1.0.30"
+rustc-hash = "2.0.0"
+thiserror = "2.0.1"
 htmlescape = "0.3.1"
 fail = { version = "0.5.0", optional = true }
-time = { version = "0.3.10", features = ["serde-well-known"] }
+time = { version = "0.3.35", features = ["serde-well-known"] }
 smallvec = "1.8.0"
 rayon = "1.5.2"
 lru = "0.12.0"
 fastdivide = "0.4.0"
-itertools = "0.13.0"
-measure_time = "0.8.2"
+itertools = "0.14.0"
+measure_time = "0.9.0"
 arc-swap = "1.5.0"
+bon = "3.3.1"
 
 columnar = { version = "0.3", path = "./columnar", package = "tantivy-columnar" }
 sstable = { version = "0.3", path = "./sstable", package = "tantivy-sstable", optional = true }
@@ -66,13 +67,14 @@ tokenizer-api = { version = "0.3", path = "./tokenizer-api", package = "tantivy-
 sketches-ddsketch = { version = "0.3.0", features = ["use_serde"] }
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 futures-util = { version = "0.3.28", optional = true }
+futures-channel = { version = "0.3.28", optional = true }
 fnv = "1.0.7"
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"
 
 [dev-dependencies]
-binggan = "0.8.0"
+binggan = "0.14.0"
 rand = "0.8.5"
 maplit = "1.0.2"
 matches = "0.1.9"
@@ -120,7 +122,7 @@ zstd-compression = ["zstd"]
 failpoints = ["fail", "fail/failpoints"]
 unstable = []                            # useful for benches.
 
-quickwit = ["sstable", "futures-util"]
+quickwit = ["sstable", "futures-util", "futures-channel"]
 
 # Compares only the hash of a string when indexing data.
 # Increases indexing speed, but may lead to extremely rare missing terms, when there's a hash collision.

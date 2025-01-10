@@ -3,7 +3,9 @@ use std::io;
 use std::net::Ipv6Addr;
 
 use columnar::column_values::CompactSpaceU64Accessor;
-use columnar::{ColumnType, Dictionary, MonotonicallyMappableToU128, MonotonicallyMappableToU64};
+use columnar::{
+    ColumnType, Dictionary, MonotonicallyMappableToU128, MonotonicallyMappableToU64, NumericalValue,
+};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
@@ -19,11 +21,11 @@ use crate::aggregation::intermediate_agg_result::{
 use crate::aggregation::segment_agg_result::{
     build_segment_agg_collector, SegmentAggregationCollector,
 };
-use crate::aggregation::{f64_from_fastfield_u64, format_date, Key};
+use crate::aggregation::{format_date, Key};
 use crate::error::DataCorruption;
 use crate::TantivyError;
 
-/// Creates a bucket for every unique term and counts the number of occurences.
+/// Creates a bucket for every unique term and counts the number of occurrences.
 /// Note that doc_count in the response buckets equals term count here.
 ///
 /// If the text is untokenized and single value, that means one term per document and therefore it
@@ -156,7 +158,7 @@ pub struct TermsAggregation {
     /// when loading the text.
     /// Special Case 1:
     /// If we have multiple columns on one field, we need to have a union on the indices on both
-    /// columns, to find docids without a value. That requires a special missing aggreggation.
+    /// columns, to find docids without a value. That requires a special missing aggregation.
     /// Special Case 2: if the key is of type text and the column is numerical, we also need to use
     /// the special missing aggregation, since there is no mechanism in the numerical column to
     /// add text.
@@ -362,7 +364,7 @@ impl SegmentTermCollector {
         let term_buckets = TermBuckets::default();
 
         if let Some(custom_order) = req.order.as_ref() {
-            // Validate sub aggregtion exists
+            // Validate sub aggregation exists
             if let OrderTarget::SubAggregation(sub_agg_name) = &custom_order.target {
                 let (agg_name, _agg_property) = get_agg_name_and_property(sub_agg_name);
 
@@ -497,6 +499,12 @@ impl SegmentTermCollector {
                     Key::F64(val) => {
                         dict.insert(IntermediateKey::F64(*val), intermediate_entry);
                     }
+                    Key::U64(val) => {
+                        dict.insert(IntermediateKey::U64(*val), intermediate_entry);
+                    }
+                    Key::I64(val) => {
+                        dict.insert(IntermediateKey::I64(*val), intermediate_entry);
+                    }
                 }
 
                 entries.swap_remove(index);
@@ -583,8 +591,26 @@ impl SegmentTermCollector {
         } else {
             for (val, doc_count) in entries {
                 let intermediate_entry = into_intermediate_bucket_entry(val, doc_count)?;
-                let val = f64_from_fastfield_u64(val, &self.column_type);
-                dict.insert(IntermediateKey::F64(val), intermediate_entry);
+                if self.column_type == ColumnType::U64 {
+                    dict.insert(IntermediateKey::U64(val), intermediate_entry);
+                } else if self.column_type == ColumnType::I64 {
+                    dict.insert(IntermediateKey::I64(i64::from_u64(val)), intermediate_entry);
+                } else {
+                    let val = f64::from_u64(val);
+                    let val: NumericalValue = val.into();
+
+                    match val.normalize() {
+                        NumericalValue::U64(val) => {
+                            dict.insert(IntermediateKey::U64(val), intermediate_entry);
+                        }
+                        NumericalValue::I64(val) => {
+                            dict.insert(IntermediateKey::I64(val), intermediate_entry);
+                        }
+                        NumericalValue::F64(val) => {
+                            dict.insert(IntermediateKey::F64(val), intermediate_entry);
+                        }
+                    }
+                };
             }
         };
 
@@ -643,7 +669,7 @@ mod tests {
         exec_request, exec_request_with_query, exec_request_with_query_and_memory_limit,
         get_test_index_from_terms, get_test_index_from_values_and_terms,
     };
-    use crate::aggregation::AggregationLimits;
+    use crate::aggregation::AggregationLimitsGuard;
     use crate::indexer::NoMergePolicy;
     use crate::schema::{IntoIpv6Addr, Schema, FAST, STRING};
     use crate::{Index, IndexWriter};
@@ -1206,8 +1232,8 @@ mod tests {
     #[test]
     fn terms_aggregation_min_doc_count_special_case() -> crate::Result<()> {
         let terms_per_segment = vec![
-            vec!["terma", "terma", "termb", "termb", "termb", "termc"],
-            vec!["terma", "terma", "termb", "termc", "termc"],
+            vec!["terma", "terma", "termb", "termb", "termb"],
+            vec!["terma", "terma", "termb"],
         ];
 
         let index = get_test_index_from_terms(false, &terms_per_segment)?;
@@ -1229,8 +1255,6 @@ mod tests {
         assert_eq!(res["my_texts"]["buckets"][0]["doc_count"], 4);
         assert_eq!(res["my_texts"]["buckets"][1]["key"], "termb");
         assert_eq!(res["my_texts"]["buckets"][1]["doc_count"], 0);
-        assert_eq!(res["my_texts"]["buckets"][2]["key"], "termc");
-        assert_eq!(res["my_texts"]["buckets"][2]["doc_count"], 0);
         assert_eq!(res["my_texts"]["sum_other_doc_count"], 0);
         assert_eq!(res["my_texts"]["doc_count_error_upper_bound"], 0);
 
@@ -1398,7 +1422,7 @@ mod tests {
             agg_req,
             &index,
             None,
-            AggregationLimits::new(Some(50_000), None),
+            AggregationLimitsGuard::new(Some(50_000), None),
         )
         .unwrap_err();
         assert!(res
@@ -1659,7 +1683,7 @@ mod tests {
             res["my_texts"]["buckets"][2]["key"],
             serde_json::Value::Null
         );
-        // text field with numner as missing fallback
+        // text field with number as missing fallback
         assert_eq!(res["my_texts2"]["buckets"][0]["key"], "Hello Hello");
         assert_eq!(res["my_texts2"]["buckets"][0]["doc_count"], 5);
         assert_eq!(res["my_texts2"]["buckets"][1]["key"], 1337.0);
@@ -1713,6 +1737,54 @@ mod tests {
         assert_eq!(res["my_ids"]["buckets"][0]["key"], 1337.0);
         assert_eq!(res["my_ids"]["buckets"][0]["doc_count"], 2);
         assert_eq!(res["my_ids"]["buckets"][1]["key"], 1.0);
+        assert_eq!(res["my_ids"]["buckets"][1]["doc_count"], 1);
+        assert_eq!(res["my_ids"]["buckets"][2]["key"], serde_json::Value::Null);
+
+        Ok(())
+    }
+
+    #[test]
+    fn terms_aggregation_u64_value() -> crate::Result<()> {
+        // Make sure that large u64 are not truncated
+        let mut schema_builder = Schema::builder();
+        let id_field = schema_builder.add_u64_field("id", FAST);
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+            index_writer.set_merge_policy(Box::new(NoMergePolicy));
+            index_writer.add_document(doc!(
+                id_field => 9_223_372_036_854_775_807u64,
+            ))?;
+            index_writer.add_document(doc!(
+                id_field => 1_769_070_189_829_214_202u64,
+            ))?;
+            index_writer.add_document(doc!(
+                id_field => 1_769_070_189_829_214_202u64,
+            ))?;
+            index_writer.commit()?;
+        }
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_ids": {
+                "terms": {
+                    "field": "id"
+                },
+            }
+        }))
+        .unwrap();
+
+        let res = exec_request_with_query(agg_req, &index, None)?;
+
+        // id field
+        assert_eq!(
+            res["my_ids"]["buckets"][0]["key"],
+            1_769_070_189_829_214_202u64
+        );
+        assert_eq!(res["my_ids"]["buckets"][0]["doc_count"], 2);
+        assert_eq!(
+            res["my_ids"]["buckets"][1]["key"],
+            9_223_372_036_854_775_807u64
+        );
         assert_eq!(res["my_ids"]["buckets"][1]["doc_count"], 1);
         assert_eq!(res["my_ids"]["buckets"][2]["key"], serde_json::Value::Null);
 
@@ -1785,7 +1857,7 @@ mod tests {
             res["my_texts"]["buckets"][2]["key"],
             serde_json::Value::Null
         );
-        // text field with numner as missing fallback
+        // text field with number as missing fallback
         assert_eq!(res["my_texts2"]["buckets"][0]["key"], "Hello Hello");
         assert_eq!(res["my_texts2"]["buckets"][0]["doc_count"], 4);
         assert_eq!(res["my_texts2"]["buckets"][1]["key"], 1337.0);

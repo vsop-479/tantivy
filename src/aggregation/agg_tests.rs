@@ -5,7 +5,7 @@ use crate::aggregation::agg_result::AggregationResults;
 use crate::aggregation::buf_collector::DOC_BLOCK_SIZE;
 use crate::aggregation::collector::AggregationCollector;
 use crate::aggregation::intermediate_agg_result::IntermediateAggregationResults;
-use crate::aggregation::segment_agg_result::AggregationLimits;
+use crate::aggregation::segment_agg_result::AggregationLimitsGuard;
 use crate::aggregation::tests::{get_test_index_2_segments, get_test_index_from_values_and_terms};
 use crate::aggregation::DistributedAggregationCollector;
 use crate::query::{AllQuery, TermQuery};
@@ -130,7 +130,7 @@ fn test_aggregation_flushing(
     let agg_res: AggregationResults = if use_distributed_collector {
         let collector = DistributedAggregationCollector::from_aggs(
             agg_req.clone(),
-            AggregationLimits::default(),
+            AggregationLimitsGuard::default(),
         );
 
         let searcher = reader.searcher();
@@ -146,7 +146,7 @@ fn test_aggregation_flushing(
                 .expect("Post deserialization failed");
 
         intermediate_agg_result
-            .into_final_result(agg_req, &Default::default())
+            .into_final_result(agg_req, Default::default())
             .unwrap()
     } else {
         let collector = get_collector(agg_req);
@@ -460,7 +460,7 @@ fn test_aggregation_level2(
 
         let searcher = reader.searcher();
         let res = searcher.search(&term_query, &collector).unwrap();
-        res.into_final_result(agg_req.clone(), &Default::default())
+        res.into_final_result(agg_req.clone(), Default::default())
             .unwrap()
     } else {
         let collector = get_collector(agg_req.clone());
@@ -870,7 +870,7 @@ fn test_aggregation_on_json_object_mixed_types() {
         .add_document(doc!(json => json!({"mixed_type": "blue", "mixed_price": 5.0})))
         .unwrap();
     index_writer.commit().unwrap();
-    // => Segment with all boolen
+    // => Segment with all boolean
     index_writer
         .add_document(doc!(json => json!({"mixed_type": true, "mixed_price": "no_price"})))
         .unwrap();
@@ -939,12 +939,69 @@ fn test_aggregation_on_json_object_mixed_types() {
           },
           "termagg": {
             "buckets": [
-              { "doc_count": 1, "key": 10.0, "min_price": { "value": 10.0 } },
+              { "doc_count": 1, "key": 10, "min_price": { "value": 10.0 } },
               { "doc_count": 3, "key": "blue", "min_price": { "value": 5.0 } },
               { "doc_count": 2, "key": "red", "min_price": { "value": 1.0 } },
               { "doc_count": 1, "key": -20.5, "min_price": { "value": -20.5 } },
-              { "doc_count": 2, "key": 1.0, "key_as_string": "true", "min_price": { "value": null } },
+              { "doc_count": 2, "key": 1, "key_as_string": "true", "min_price": { "value": null } },
             ],
+            "sum_other_doc_count": 0
+          }
+        }
+        )
+    );
+}
+
+#[test]
+fn test_aggregation_on_json_object_mixed_numerical_segments() {
+    let mut schema_builder = Schema::builder();
+    let json = schema_builder.add_json_field("json", FAST);
+    let schema = schema_builder.build();
+    let index = Index::create_in_ram(schema);
+    let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+    // => Segment with all values f64 numeric
+    index_writer
+        .add_document(doc!(json => json!({"mixed_price": 10.5})))
+        .unwrap();
+    // Gets converted to f64!
+    index_writer
+        .add_document(doc!(json => json!({"mixed_price": 10})))
+        .unwrap();
+    index_writer.commit().unwrap();
+    // => Segment with all values i64 numeric
+    index_writer
+        .add_document(doc!(json => json!({"mixed_price": 10})))
+        .unwrap();
+    index_writer.commit().unwrap();
+
+    index_writer.commit().unwrap();
+
+    // All bucket types
+    let agg_req_str = r#"
+    {
+        "termagg": {
+            "terms": {
+                "field": "json.mixed_price"
+            }
+        }
+    } "#;
+    let agg: Aggregations = serde_json::from_str(agg_req_str).unwrap();
+    let aggregation_collector = get_collector(agg);
+    let reader = index.reader().unwrap();
+    let searcher = reader.searcher();
+
+    let aggregation_results = searcher.search(&AllQuery, &aggregation_collector).unwrap();
+    let aggregation_res_json = serde_json::to_value(aggregation_results).unwrap();
+    use pretty_assertions::assert_eq;
+    assert_eq!(
+        &aggregation_res_json,
+        &serde_json::json!({
+          "termagg": {
+            "buckets": [
+              { "doc_count": 2, "key": 10},
+              { "doc_count": 1, "key": 10.5},
+            ],
+            "doc_count_error_upper_bound": 0,
             "sum_other_doc_count": 0
           }
         }

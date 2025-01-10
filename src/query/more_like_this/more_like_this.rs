@@ -209,7 +209,7 @@ impl MoreLikeThis {
                     }
                 };
 
-                // TOOD: Validate these changed align with the HEAD branch.
+                // TODO: Validate these changed align with the HEAD branch.
                 for value in values {
                     if let Some(text) = value.as_str() {
                         let tokenizer = match &mut tokenizer_opt {
@@ -241,7 +241,7 @@ impl MoreLikeThis {
                     let timestamp = value.as_datetime().ok_or_else(|| {
                         TantivyError::InvalidArgument("invalid value".to_string())
                     })?;
-                    let term = Term::from_field_date(field, timestamp);
+                    let term = Term::from_field_date_for_search(field, timestamp);
                     *term_frequencies.entry(term).or_insert(0) += 1;
                 }
             }
@@ -295,7 +295,7 @@ impl MoreLikeThis {
         self.stop_words.contains(&word)
     }
 
-    /// Couputes the score for each term while ignoring not useful terms
+    /// Computes the score for each term while ignoring not useful terms
     fn create_score_term(
         &self,
         searcher: &Searcher,

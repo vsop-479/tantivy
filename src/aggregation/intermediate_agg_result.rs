@@ -22,7 +22,7 @@ use super::metric::{
     IntermediateAverage, IntermediateCount, IntermediateExtendedStats, IntermediateMax,
     IntermediateMin, IntermediateStats, IntermediateSum, PercentilesCollector, TopHitsTopNComputer,
 };
-use super::segment_agg_result::AggregationLimits;
+use super::segment_agg_result::AggregationLimitsGuard;
 use super::{format_date, AggregationError, Key, SerializedKey};
 use crate::aggregation::agg_result::{AggregationResults, BucketEntries, BucketEntry};
 use crate::aggregation::bucket::TermsAggregationInternal;
@@ -51,12 +51,18 @@ pub enum IntermediateKey {
     Str(String),
     /// `f64` key
     F64(f64),
+    /// `i64` key
+    I64(i64),
+    /// `u64` key
+    U64(u64),
 }
 impl From<Key> for IntermediateKey {
     fn from(value: Key) -> Self {
         match value {
             Key::Str(s) => Self::Str(s),
             Key::F64(f) => Self::F64(f),
+            Key::U64(f) => Self::U64(f),
+            Key::I64(f) => Self::I64(f),
         }
     }
 }
@@ -73,7 +79,9 @@ impl From<IntermediateKey> for Key {
                 }
             }
             IntermediateKey::F64(f) => Self::F64(f),
-            IntermediateKey::Bool(f) => Self::F64(f as u64 as f64),
+            IntermediateKey::Bool(f) => Self::U64(f as u64),
+            IntermediateKey::U64(f) => Self::U64(f),
+            IntermediateKey::I64(f) => Self::I64(f),
         }
     }
 }
@@ -86,6 +94,8 @@ impl std::hash::Hash for IntermediateKey {
         match self {
             IntermediateKey::Str(text) => text.hash(state),
             IntermediateKey::F64(val) => val.to_bits().hash(state),
+            IntermediateKey::U64(val) => val.hash(state),
+            IntermediateKey::I64(val) => val.hash(state),
             IntermediateKey::Bool(val) => val.hash(state),
             IntermediateKey::IpAddr(val) => val.hash(state),
         }
@@ -112,9 +122,9 @@ impl IntermediateAggregationResults {
     pub fn into_final_result(
         self,
         req: Aggregations,
-        limits: &AggregationLimits,
+        mut limits: AggregationLimitsGuard,
     ) -> crate::Result<AggregationResults> {
-        let res = self.into_final_result_internal(&req, limits)?;
+        let res = self.into_final_result_internal(&req, &mut limits)?;
         let bucket_count = res.get_bucket_count() as u32;
         if bucket_count > limits.get_bucket_limit() {
             return Err(TantivyError::AggregationError(
@@ -131,7 +141,7 @@ impl IntermediateAggregationResults {
     pub(crate) fn into_final_result_internal(
         self,
         req: &Aggregations,
-        limits: &AggregationLimits,
+        limits: &mut AggregationLimitsGuard,
     ) -> crate::Result<AggregationResults> {
         let mut results: FxHashMap<String, AggregationResult> = FxHashMap::default();
         for (key, agg_res) in self.aggs_res.into_iter() {
@@ -247,7 +257,7 @@ impl IntermediateAggregationResult {
     pub(crate) fn into_final_result(
         self,
         req: &Aggregation,
-        limits: &AggregationLimits,
+        limits: &mut AggregationLimitsGuard,
     ) -> crate::Result<AggregationResult> {
         let res = match self {
             IntermediateAggregationResult::Bucket(bucket) => {
@@ -422,7 +432,7 @@ impl IntermediateBucketResult {
     pub(crate) fn into_final_bucket_result(
         self,
         req: &Aggregation,
-        limits: &AggregationLimits,
+        limits: &mut AggregationLimitsGuard,
     ) -> crate::Result<BucketResult> {
         match self {
             IntermediateBucketResult::Range(range_res) => {
@@ -586,7 +596,7 @@ impl IntermediateTermBucketResult {
         self,
         req: &TermsAggregation,
         sub_aggregation_req: &Aggregations,
-        limits: &AggregationLimits,
+        limits: &mut AggregationLimitsGuard,
     ) -> crate::Result<BucketResult> {
         let req = TermsAggregationInternal::from_req(req);
         let mut buckets: Vec<BucketEntry> = self
@@ -713,7 +723,7 @@ impl IntermediateHistogramBucketEntry {
     pub(crate) fn into_final_bucket_entry(
         self,
         req: &Aggregations,
-        limits: &AggregationLimits,
+        limits: &mut AggregationLimitsGuard,
     ) -> crate::Result<BucketEntry> {
         Ok(BucketEntry {
             key_as_string: None,
@@ -748,7 +758,7 @@ impl IntermediateRangeBucketEntry {
         req: &Aggregations,
         _range_req: &RangeAggregation,
         column_type: Option<ColumnType>,
-        limits: &AggregationLimits,
+        limits: &mut AggregationLimitsGuard,
     ) -> crate::Result<RangeBucketEntry> {
         let mut range_bucket_entry = RangeBucketEntry {
             key: self.key.into(),
@@ -850,7 +860,7 @@ mod tests {
         }
     }
 
-    fn get_intermediat_tree_with_ranges(
+    fn get_intermediate_tree_with_ranges(
         data: &[(String, u64, String, u64)],
     ) -> IntermediateAggregationResults {
         let mut map = HashMap::new();
@@ -886,18 +896,18 @@ mod tests {
 
     #[test]
     fn test_merge_fruits_tree_1() {
-        let mut tree_left = get_intermediat_tree_with_ranges(&[
+        let mut tree_left = get_intermediate_tree_with_ranges(&[
             ("red".to_string(), 50, "1900".to_string(), 25),
             ("blue".to_string(), 30, "1900".to_string(), 30),
         ]);
-        let tree_right = get_intermediat_tree_with_ranges(&[
+        let tree_right = get_intermediate_tree_with_ranges(&[
             ("red".to_string(), 60, "1900".to_string(), 30),
             ("blue".to_string(), 25, "1900".to_string(), 50),
         ]);
 
         tree_left.merge_fruits(tree_right).unwrap();
 
-        let tree_expected = get_intermediat_tree_with_ranges(&[
+        let tree_expected = get_intermediate_tree_with_ranges(&[
             ("red".to_string(), 110, "1900".to_string(), 55),
             ("blue".to_string(), 55, "1900".to_string(), 80),
         ]);
@@ -907,18 +917,18 @@ mod tests {
 
     #[test]
     fn test_merge_fruits_tree_2() {
-        let mut tree_left = get_intermediat_tree_with_ranges(&[
+        let mut tree_left = get_intermediate_tree_with_ranges(&[
             ("red".to_string(), 50, "1900".to_string(), 25),
             ("blue".to_string(), 30, "1900".to_string(), 30),
         ]);
-        let tree_right = get_intermediat_tree_with_ranges(&[
+        let tree_right = get_intermediate_tree_with_ranges(&[
             ("red".to_string(), 60, "1900".to_string(), 30),
             ("green".to_string(), 25, "1900".to_string(), 50),
         ]);
 
         tree_left.merge_fruits(tree_right).unwrap();
 
-        let tree_expected = get_intermediat_tree_with_ranges(&[
+        let tree_expected = get_intermediate_tree_with_ranges(&[
             ("red".to_string(), 110, "1900".to_string(), 55),
             ("blue".to_string(), 30, "1900".to_string(), 30),
             ("green".to_string(), 25, "1900".to_string(), 50),
@@ -929,7 +939,7 @@ mod tests {
 
     #[test]
     fn test_merge_fruits_tree_empty() {
-        let mut tree_left = get_intermediat_tree_with_ranges(&[
+        let mut tree_left = get_intermediate_tree_with_ranges(&[
             ("red".to_string(), 50, "1900".to_string(), 25),
             ("blue".to_string(), 30, "1900".to_string(), 30),
         ]);

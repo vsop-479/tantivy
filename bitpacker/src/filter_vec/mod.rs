@@ -35,8 +35,8 @@ const IMPLS: [FilterImplPerInstructionSet; 2] = [
 const IMPLS: [FilterImplPerInstructionSet; 1] = [FilterImplPerInstructionSet::Scalar];
 
 impl FilterImplPerInstructionSet {
-    #[allow(unused_variables)]
     #[inline]
+    #[allow(unused_variables)] // on non-x86_64, code is unused.
     fn from(code: u8) -> FilterImplPerInstructionSet {
         #[cfg(target_arch = "x86_64")]
         if code == FilterImplPerInstructionSet::AVX2 as u8 {

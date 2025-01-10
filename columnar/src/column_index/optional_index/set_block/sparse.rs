@@ -31,8 +31,10 @@ impl<'a> SelectCursor<u16> for SparseBlock<'a> {
     }
 }
 
-impl<'a> Set<u16> for SparseBlock<'a> {
-    type SelectCursor<'b> = Self where Self: 'b;
+impl Set<u16> for SparseBlock<'_> {
+    type SelectCursor<'b>
+        = Self
+    where Self: 'b;
 
     #[inline(always)]
     fn contains(&self, el: u16) -> bool {
@@ -67,7 +69,7 @@ fn get_u16(data: &[u8], byte_position: usize) -> u16 {
     u16::from_le_bytes(bytes)
 }
 
-impl<'a> SparseBlock<'a> {
+impl SparseBlock<'_> {
     #[inline(always)]
     fn value_at_idx(&self, data: &[u8], idx: u16) -> u16 {
         let start_offset: usize = idx as usize * 2;
@@ -80,7 +82,7 @@ impl<'a> SparseBlock<'a> {
     }
 
     #[inline]
-    #[allow(clippy::comparison_chain)]
+    #[expect(clippy::comparison_chain)]
     // Looks for the element in the block. Returns the positions if found.
     fn binary_search(&self, target: u16) -> Result<u16, u16> {
         let data = &self.0;

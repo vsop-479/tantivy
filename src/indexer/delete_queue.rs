@@ -179,8 +179,7 @@ impl DeleteCursor {
     /// Skips operations and position it so that
     /// - either all of the delete operation currently in the queue are consume and the next get
     ///   will return `None`.
-    /// - the next get will return the first operation with an
-    /// `opstamp >= target_opstamp`.
+    /// - the next get will return the first operation with an `opstamp >= target_opstamp`.
     pub fn skip_to(&mut self, target_opstamp: Opstamp) {
         // TODO Can be optimize as we work with block.
         while self.is_behind_opstamp(target_opstamp) {
@@ -188,7 +187,6 @@ impl DeleteCursor {
         }
     }
 
-    #[allow(clippy::wrong_self_convention)]
     fn is_behind_opstamp(&mut self, target_opstamp: Opstamp) -> bool {
         self.get()
             .map(|operation| operation.opstamp < target_opstamp)

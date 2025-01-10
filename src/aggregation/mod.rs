@@ -148,7 +148,7 @@ mod agg_tests;
 
 use core::fmt;
 
-pub use agg_limits::AggregationLimits;
+pub use agg_limits::AggregationLimitsGuard;
 pub use collector::{
     AggregationCollector, AggregationSegmentCollector, DistributedAggregationCollector,
     DEFAULT_BUCKET_LIMIT,
@@ -180,7 +180,7 @@ pub(crate) fn deserialize_option_f64<'de, D>(deserializer: D) -> Result<Option<f
 where D: Deserializer<'de> {
     struct StringOrFloatVisitor;
 
-    impl<'de> Visitor<'de> for StringOrFloatVisitor {
+    impl Visitor<'_> for StringOrFloatVisitor {
         type Value = Option<f64>;
 
         fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -226,7 +226,7 @@ pub(crate) fn deserialize_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
 where D: Deserializer<'de> {
     struct StringOrFloatVisitor;
 
-    impl<'de> Visitor<'de> for StringOrFloatVisitor {
+    impl Visitor<'_> for StringOrFloatVisitor {
         type Value = f64;
 
         fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -336,10 +336,16 @@ pub type SerializedKey = String;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialOrd)]
 /// The key to identify a bucket.
+///
+/// The order is important, with serde untagged, that we try to deserialize into i64 first.
 #[serde(untagged)]
 pub enum Key {
     /// String key
     Str(String),
+    /// `i64` key
+    I64(i64),
+    /// `u64` key
+    U64(u64),
     /// `f64` key
     F64(f64),
 }
@@ -350,6 +356,8 @@ impl std::hash::Hash for Key {
         match self {
             Key::Str(text) => text.hash(state),
             Key::F64(val) => val.to_bits().hash(state),
+            Key::U64(val) => val.hash(state),
+            Key::I64(val) => val.hash(state),
         }
     }
 }
@@ -369,6 +377,8 @@ impl Display for Key {
         match self {
             Key::Str(val) => f.write_str(val),
             Key::F64(val) => f.write_str(&val.to_string()),
+            Key::U64(val) => f.write_str(&val.to_string()),
+            Key::I64(val) => f.write_str(&val.to_string()),
         }
     }
 }
@@ -448,7 +458,7 @@ mod tests {
         agg_req: Aggregations,
         index: &Index,
         query: Option<(&str, &str)>,
-        limits: AggregationLimits,
+        limits: AggregationLimitsGuard,
     ) -> crate::Result<Value> {
         let collector = AggregationCollector::from_aggs(agg_req, limits);
 
@@ -568,7 +578,7 @@ mod tests {
             .set_indexing_options(
                 TextFieldIndexing::default().set_index_option(IndexRecordOption::WithFreqs),
             )
-            .set_fast(None)
+            .set_fast(Some("raw"))
             .set_stored();
         let text_field = schema_builder.add_text_field("text", text_fieldtype);
         let date_field = schema_builder.add_date_field("date", FAST);

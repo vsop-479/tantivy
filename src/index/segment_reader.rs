@@ -358,7 +358,7 @@ impl SegmentReader {
             .map(|(mut field_name, handle)| {
                 json_path_sep_to_dot(&mut field_name);
                 // map to canonical path, to avoid similar but different entries.
-                // Eventually we should just accept '.' seperated for all cases.
+                // Eventually we should just accept '.' separated for all cases.
                 let field_name = map_to_canonical
                     .get(&field_name)
                     .unwrap_or(&field_name)
@@ -478,7 +478,7 @@ pub fn merge_field_meta_data(
         .into_iter()
         .kmerge_by(|left, right| left < right)
         // TODO: Remove allocation
-        .group_by(|el| (el.field_name.to_string(), el.typ))
+        .chunk_by(|el| (el.field_name.to_string(), el.typ))
     {
         let mut merged: FieldMetadata = group.next().unwrap();
         for el in group {

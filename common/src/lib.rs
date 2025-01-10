@@ -5,6 +5,7 @@ use std::ops::Deref;
 pub use byteorder::LittleEndian as Endianness;
 
 mod bitset;
+pub mod bounds;
 mod byte_count;
 mod datetime;
 pub mod file_slice;
@@ -129,11 +130,11 @@ pub fn replace_in_place(needle: u8, replacement: u8, bytes: &mut [u8]) {
 }
 
 #[cfg(test)]
-pub mod test {
+pub(crate) mod test {
 
     use proptest::prelude::*;
 
-    use super::{f64_to_u64, i64_to_u64, u64_to_f64, u64_to_i64, BinarySerializable, FixedSize};
+    use super::{f64_to_u64, i64_to_u64, u64_to_f64, u64_to_i64};
 
     fn test_i64_converter_helper(val: i64) {
         assert_eq!(u64_to_i64(i64_to_u64(val)), val);
@@ -141,12 +142,6 @@ pub mod test {
 
     fn test_f64_converter_helper(val: f64) {
         assert_eq!(u64_to_f64(f64_to_u64(val)), val);
-    }
-
-    pub fn fixed_size_test<O: BinarySerializable + FixedSize + Default>() {
-        let mut buffer = Vec::new();
-        O::default().serialize(&mut buffer).unwrap();
-        assert_eq!(buffer.len(), O::SIZE_IN_BYTES);
     }
 
     proptest! {

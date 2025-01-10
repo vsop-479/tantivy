@@ -4,8 +4,11 @@ use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
+use common::bounds::{transform_bound_inner_res, TransformBound};
 use common::file_slice::FileSlice;
 use common::{BinarySerializable, OwnedBytes};
+use futures_util::{stream, StreamExt, TryStreamExt};
+use itertools::Itertools;
 use tantivy_fst::automaton::AlwaysMatch;
 use tantivy_fst::Automaton;
 
@@ -56,29 +59,6 @@ impl Dictionary<VoidSSTable> {
     }
 }
 
-fn map_bound<TFrom, TTo>(bound: &Bound<TFrom>, transform: impl Fn(&TFrom) -> TTo) -> Bound<TTo> {
-    use self::Bound::*;
-    match bound {
-        Excluded(ref from_val) => Bound::Excluded(transform(from_val)),
-        Included(ref from_val) => Bound::Included(transform(from_val)),
-        Unbounded => Unbounded,
-    }
-}
-
-/// Takes a bound and transforms the inner value into a new bound via a closure.
-/// The bound variant may change by the value returned value from the closure.
-fn transform_bound_inner<TFrom, TTo>(
-    bound: &Bound<TFrom>,
-    transform: impl Fn(&TFrom) -> io::Result<Bound<TTo>>,
-) -> io::Result<Bound<TTo>> {
-    use self::Bound::*;
-    Ok(match bound {
-        Excluded(ref from_val) => transform(from_val)?,
-        Included(ref from_val) => transform(from_val)?,
-        Unbounded => Unbounded,
-    })
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TermOrdHit {
     /// Exact term ord hit
@@ -120,20 +100,52 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         &self,
         key_range: impl RangeBounds<[u8]>,
         limit: Option<u64>,
+        automaton: &impl Automaton,
+        merge_holes_under_bytes: usize,
     ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
-        let slice = self.file_slice_for_range(key_range, limit);
-        let data = slice.read_bytes_async().await?;
-        Ok(TSSTable::delta_reader(data))
+        let match_all = automaton.will_always_match(&automaton.start());
+        if match_all {
+            let slice = self.file_slice_for_range(key_range, limit);
+            let data = slice.read_bytes_async().await?;
+            Ok(TSSTable::delta_reader(data))
+        } else {
+            let blocks = stream::iter(self.get_block_iterator_for_range_and_automaton(
+                key_range,
+                automaton,
+                merge_holes_under_bytes,
+            ));
+            let data = blocks
+                .map(|block_addr| {
+                    self.sstable_slice
+                        .read_bytes_slice_async(block_addr.byte_range)
+                })
+                .buffered(5)
+                .try_collect::<Vec<_>>()
+                .await?;
+            Ok(DeltaReader::from_multiple_blocks(data))
+        }
     }
 
     pub(crate) fn sstable_delta_reader_for_key_range(
         &self,
         key_range: impl RangeBounds<[u8]>,
         limit: Option<u64>,
+        automaton: &impl Automaton,
     ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
-        let slice = self.file_slice_for_range(key_range, limit);
-        let data = slice.read_bytes()?;
-        Ok(TSSTable::delta_reader(data))
+        let match_all = automaton.will_always_match(&automaton.start());
+        if match_all {
+            let slice = self.file_slice_for_range(key_range, limit);
+            let data = slice.read_bytes()?;
+            Ok(TSSTable::delta_reader(data))
+        } else {
+            // if operations are sync, we assume latency is almost null, and there is no point in
+            // merging accross holes
+            let blocks = self.get_block_iterator_for_range_and_automaton(key_range, automaton, 0);
+            let data = blocks
+                .map(|block_addr| self.sstable_slice.read_bytes_slice(block_addr.byte_range))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(DeltaReader::from_multiple_blocks(data))
+        }
     }
 
     pub(crate) fn sstable_delta_reader_block(
@@ -226,6 +238,42 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         self.sstable_slice.slice((start_bound, end_bound))
     }
 
+    fn get_block_iterator_for_range_and_automaton<'a>(
+        &'a self,
+        key_range: impl RangeBounds<[u8]>,
+        automaton: &'a impl Automaton,
+        merge_holes_under_bytes: usize,
+    ) -> impl Iterator<Item = BlockAddr> + 'a {
+        let lower_bound = match key_range.start_bound() {
+            Bound::Included(key) | Bound::Excluded(key) => {
+                self.sstable_index.locate_with_key(key).unwrap_or(u64::MAX)
+            }
+            Bound::Unbounded => 0,
+        };
+
+        let upper_bound = match key_range.end_bound() {
+            Bound::Included(key) | Bound::Excluded(key) => {
+                self.sstable_index.locate_with_key(key).unwrap_or(u64::MAX)
+            }
+            Bound::Unbounded => u64::MAX,
+        };
+        let block_range = lower_bound..=upper_bound;
+        self.sstable_index
+            .get_block_for_automaton(automaton)
+            .filter(move |(block_id, _)| block_range.contains(block_id))
+            .map(|(_, block_addr)| block_addr)
+            .coalesce(move |first, second| {
+                if first.byte_range.end + merge_holes_under_bytes >= second.byte_range.start {
+                    Ok(BlockAddr {
+                        first_ordinal: first.first_ordinal,
+                        byte_range: first.byte_range.start..second.byte_range.end,
+                    })
+                } else {
+                    Err((first, second))
+                }
+            })
+    }
+
     /// Opens a `TermDictionary`.
     pub fn open(term_dictionary_file: FileSlice) -> io::Result<Self> {
         let (main_slice, footer_len_slice) = term_dictionary_file.split_from_end(20);
@@ -260,7 +308,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
-                    format!("Unsuported sstable version, expected one of [2, 3], found {version}"),
+                    format!("Unsupported sstable version, expected one of [2, 3], found {version}"),
                 ))
             }
         };
@@ -409,18 +457,18 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         lower_bound: Bound<K>,
         upper_bound: Bound<K>,
     ) -> io::Result<(Bound<TermOrdinal>, Bound<TermOrdinal>)> {
-        let lower_bound = transform_bound_inner(&lower_bound, |start_bound_bytes| {
+        let lower_bound = transform_bound_inner_res(&lower_bound, |start_bound_bytes| {
             let ord = self.term_ord_or_next(start_bound_bytes)?;
             match ord {
-                TermOrdHit::Exact(ord) => Ok(map_bound(&lower_bound, |_| ord)),
-                TermOrdHit::Next(ord) => Ok(Bound::Included(ord)), // Change bounds to included
+                TermOrdHit::Exact(ord) => Ok(TransformBound::Existing(ord)),
+                TermOrdHit::Next(ord) => Ok(TransformBound::NewBound(Bound::Included(ord))), /* Change bounds to included */
             }
         })?;
-        let upper_bound = transform_bound_inner(&upper_bound, |end_bound_bytes| {
+        let upper_bound = transform_bound_inner_res(&upper_bound, |end_bound_bytes| {
             let ord = self.term_ord_or_next(end_bound_bytes)?;
             match ord {
-                TermOrdHit::Exact(ord) => Ok(map_bound(&upper_bound, |_| ord)),
-                TermOrdHit::Next(ord) => Ok(Bound::Excluded(ord)), // Change bounds to excluded
+                TermOrdHit::Exact(ord) => Ok(TransformBound::Existing(ord)),
+                TermOrdHit::Next(ord) => Ok(TransformBound::NewBound(Bound::Excluded(ord))), /* Change bounds to excluded */
             }
         })?;
         Ok((lower_bound, upper_bound))
@@ -541,6 +589,25 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     /// within an interval.
     pub fn range(&self) -> StreamerBuilder<TSSTable> {
         StreamerBuilder::new(self, AlwaysMatch)
+    }
+
+    /// Returns a range builder filtered with a prefix.
+    pub fn prefix_range<K: AsRef<[u8]>>(&self, prefix: K) -> StreamerBuilder<TSSTable> {
+        let lower_bound = prefix.as_ref();
+        let mut upper_bound = lower_bound.to_vec();
+        for idx in (0..upper_bound.len()).rev() {
+            if upper_bound[idx] == 255 {
+                upper_bound.pop();
+            } else {
+                upper_bound[idx] += 1;
+                break;
+            }
+        }
+        let mut builder = self.range().ge(lower_bound);
+        if !upper_bound.is_empty() {
+            builder = builder.lt(upper_bound);
+        }
+        builder
     }
 
     /// A stream of all the sorted terms.
@@ -948,6 +1015,64 @@ mod tests {
             assert_eq!(stream.value(), &i);
             assert_eq!(stream.key(), format!("{i:05X}").into_bytes());
         }
+        assert!(!stream.advance());
+    }
+
+    #[test]
+    fn test_prefix() {
+        let (dic, _slice) = make_test_sstable();
+        {
+            let mut stream = dic.prefix_range("1").into_stream().unwrap();
+            for i in 0x10000..0x20000 {
+                assert!(stream.advance());
+                assert_eq!(stream.term_ord(), i);
+                assert_eq!(stream.value(), &i);
+                assert_eq!(stream.key(), format!("{i:05X}").into_bytes());
+            }
+            assert!(!stream.advance());
+        }
+        {
+            let mut stream = dic.prefix_range("").into_stream().unwrap();
+            for i in 0..0x3ffff {
+                assert!(stream.advance(), "failed at {i:05X}");
+                assert_eq!(stream.term_ord(), i);
+                assert_eq!(stream.value(), &i);
+                assert_eq!(stream.key(), format!("{i:05X}").into_bytes());
+            }
+            assert!(!stream.advance());
+        }
+        {
+            let mut stream = dic.prefix_range("0FF").into_stream().unwrap();
+            for i in 0x0ff00..=0x0ffff {
+                assert!(stream.advance(), "failed at {i:05X}");
+                assert_eq!(stream.term_ord(), i);
+                assert_eq!(stream.value(), &i);
+                assert_eq!(stream.key(), format!("{i:05X}").into_bytes());
+            }
+            assert!(!stream.advance());
+        }
+    }
+
+    #[test]
+    fn test_prefix_edge() {
+        let dict = {
+            let mut builder = Dictionary::<MonotonicU64SSTable>::builder(Vec::new()).unwrap();
+            builder.insert(&[0, 254], &0).unwrap();
+            builder.insert(&[0, 255], &1).unwrap();
+            builder.insert(&[0, 255, 12], &2).unwrap();
+            builder.insert(&[1], &2).unwrap();
+            builder.insert(&[1, 0], &2).unwrap();
+            let table = builder.finish().unwrap();
+            let table = Arc::new(PermissionedHandle::new(table));
+            let slice = common::file_slice::FileSlice::new(table.clone());
+            Dictionary::<MonotonicU64SSTable>::open(slice).unwrap()
+        };
+
+        let mut stream = dict.prefix_range(&[0, 255]).into_stream().unwrap();
+        assert!(stream.advance());
+        assert_eq!(stream.key(), &[0, 255]);
+        assert!(stream.advance());
+        assert_eq!(stream.key(), &[0, 255, 12]);
         assert!(!stream.advance());
     }
 }

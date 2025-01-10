@@ -125,8 +125,8 @@
 //!
 //! - **Searching**: [Searcher] searches the segments with anything that implements
 //!   [Query](query::Query) and merges the results. The list of [supported
-//! queries](query::Query#implementors). Custom Queries are supported by implementing the
-//! [Query](query::Query) trait.
+//!   queries](query::Query#implementors). Custom Queries are supported by implementing the
+//!   [Query](query::Query) trait.
 //!
 //! - **[Directory](directory)**: Abstraction over the storage where the index data is stored.
 //!
@@ -178,10 +178,8 @@ pub use crate::future_result::FutureResult;
 pub type Result<T> = std::result::Result<T, TantivyError>;
 
 mod core;
-#[allow(deprecated)] // Remove with index sorting
 pub mod indexer;
 
-#[allow(unused_doc_comments)]
 pub mod error;
 pub mod tokenizer;
 
@@ -190,7 +188,6 @@ pub mod collector;
 pub mod directory;
 pub mod fastfield;
 pub mod fieldnorm;
-#[allow(deprecated)] // Remove with index sorting
 pub mod index;
 pub mod positions;
 pub mod postings;
@@ -202,12 +199,15 @@ pub mod space_usage;
 pub mod store;
 pub mod termdict;
 
+mod docset;
 mod reader;
+
+#[cfg(test)]
+mod compat_tests;
 
 pub use self::reader::{IndexReader, IndexReaderBuilder, ReloadPolicy, Warmer};
 pub mod snippet;
 
-mod docset;
 use std::fmt;
 
 pub use census::{Inventory, TrackedObject};
@@ -220,7 +220,6 @@ pub use self::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
 pub use crate::core::json_utils;
 pub use crate::core::{Executor, Searcher, SearcherGeneration};
 pub use crate::directory::Directory;
-#[allow(deprecated)] // Remove with index sorting
 pub use crate::index::{
     Index, IndexBuilder, IndexMeta, IndexSettings, InvertedIndexReader, Order, Segment,
     SegmentMeta, SegmentReader,
@@ -229,9 +228,9 @@ pub use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
 pub use crate::schema::{Document, TantivyDocument, Term};
 
 /// Index format version.
-const INDEX_FORMAT_VERSION: u32 = 6;
+pub const INDEX_FORMAT_VERSION: u32 = 7;
 /// Oldest index format version this tantivy version can read.
-const INDEX_FORMAT_OLDEST_SUPPORTED_VERSION: u32 = 4;
+pub const INDEX_FORMAT_OLDEST_SUPPORTED_VERSION: u32 = 4;
 
 /// Structure version for the index.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -368,6 +367,7 @@ macro_rules! fail_point {
     }};
 }
 
+/// Common test utilities.
 #[cfg(test)]
 pub mod tests {
     use common::{BinarySerializable, FixedSize};
@@ -386,6 +386,7 @@ pub mod tests {
     use crate::schema::*;
     use crate::{DateTime, DocAddress, Index, IndexWriter, ReloadPolicy};
 
+    /// Asserts that the serialized value is the value in the trait.
     pub fn fixed_size_test<O: BinarySerializable + FixedSize + Default>() {
         let mut buffer = Vec::new();
         O::default().serialize(&mut buffer).unwrap();
@@ -418,6 +419,7 @@ pub mod tests {
         }};
     }
 
+    /// Generates random numbers
     pub fn generate_nonunique_unsorted(max_value: u32, n_elems: usize) -> Vec<u32> {
         let seed: [u8; 32] = [1; 32];
         StdRng::from_seed(seed)
@@ -426,6 +428,7 @@ pub mod tests {
             .collect::<Vec<u32>>()
     }
 
+    /// Sample `n` elements with Bernoulli distribution.
     pub fn sample_with_seed(n: u32, ratio: f64, seed_val: u8) -> Vec<u32> {
         StdRng::from_seed([seed_val; 32])
             .sample_iter(&Bernoulli::new(ratio).unwrap())
@@ -435,6 +438,7 @@ pub mod tests {
             .collect()
     }
 
+    /// Sample `n` elements with Bernoulli distribution.
     pub fn sample(n: u32, ratio: f64) -> Vec<u32> {
         sample_with_seed(n, ratio, 4)
     }

@@ -109,6 +109,8 @@ where F: nom::Parser<I, (O, ErrorList), Infallible> {
     move |input: I| match f.parse(input) {
         Ok((input, (output, _err))) => Ok((input, output)),
         Err(Err::Incomplete(needed)) => Err(Err::Incomplete(needed)),
+        // old versions don't understand this is uninhabited and need the empty match to help,
+        // newer versions warn because this arm is unreachable (which it is indeed).
         Err(Err::Error(val)) | Err(Err::Failure(val)) => match val {},
     }
 }

@@ -1,19 +1,14 @@
 use super::boolean_weight::BooleanWeight;
-use crate::query::{EnableScoring, Occur, Query, SumWithCoordsCombiner, TermQuery, Weight};
+use crate::query::{EnableScoring, Occur, Query, SumCombiner, TermQuery, Weight};
 use crate::schema::{IndexRecordOption, Term};
 
 /// The boolean query returns a set of documents
 /// that matches the Boolean combination of constituent subqueries.
 ///
-/// The documents matched by the boolean query are
-/// those which
-/// * match all of the sub queries associated with the
-/// `Must` occurrence
-/// * match none of the sub queries associated with the
-/// `MustNot` occurrence.
-/// * match at least one of the sub queries associated
-/// with the `Must` or `Should` occurrence.
-///
+/// The documents matched by the boolean query are those which
+/// - match all of the sub queries associated with the `Must` occurrence
+/// - match none of the sub queries associated with the `MustNot` occurrence.
+/// - match at least one of the sub queries associated with the `Must` or `Should` occurrence.
 ///
 /// You can combine other query types and their `Occur`ances into one `BooleanQuery`
 ///
@@ -169,7 +164,7 @@ impl Query for BooleanQuery {
             sub_weights,
             self.minimum_number_should_match,
             enable_scoring.is_scoring_enabled(),
-            Box::new(SumWithCoordsCombiner::default),
+            Box::new(SumCombiner::default),
         )))
     }
 

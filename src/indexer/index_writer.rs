@@ -45,6 +45,23 @@ fn error_in_index_worker_thread(context: &str) -> TantivyError {
     ))
 }
 
+#[derive(Clone, bon::Builder)]
+/// A builder for creating a new [IndexWriter] for an index.
+pub struct IndexWriterOptions {
+    #[builder(default = MEMORY_BUDGET_NUM_BYTES_MIN)]
+    /// The memory budget per indexer thread.
+    ///
+    /// When an indexer thread has buffered this much data in memory
+    /// it will flush the segment to disk (although this is not searchable until commit is called.)
+    memory_budget_per_thread: usize,
+    #[builder(default = 1)]
+    /// The number of indexer worker threads to use.
+    num_worker_threads: usize,
+    #[builder(default = 4)]
+    /// Defines the number of merger threads to use.
+    num_merge_threads: usize,
+}
+
 /// `IndexWriter` is the user entry-point to add document to an index.
 ///
 /// It manages a small number of indexing thread, as well as a shared
@@ -58,8 +75,7 @@ pub struct IndexWriter<D: Document = TantivyDocument> {
 
     index: Index,
 
-    // The memory budget per thread, after which a commit is triggered.
-    memory_budget_in_bytes_per_thread: usize,
+    options: IndexWriterOptions,
 
     workers_join_handle: Vec<JoinHandle<crate::Result<()>>>,
 
@@ -69,8 +85,6 @@ pub struct IndexWriter<D: Document = TantivyDocument> {
     segment_updater: SegmentUpdater,
 
     worker_id: usize,
-
-    num_threads: usize,
 
     delete_queue: DeleteQueue,
 
@@ -265,23 +279,27 @@ impl<D: Document> IndexWriter<D> {
     /// `TantivyError::InvalidArgument`
     pub(crate) fn new(
         index: &Index,
-        num_threads: usize,
-        memory_budget_in_bytes_per_thread: usize,
+        options: IndexWriterOptions,
         directory_lock: DirectoryLock,
     ) -> crate::Result<Self> {
-        if memory_budget_in_bytes_per_thread < MEMORY_BUDGET_NUM_BYTES_MIN {
+        if options.memory_budget_per_thread < MEMORY_BUDGET_NUM_BYTES_MIN {
             let err_msg = format!(
                 "The memory arena in bytes per thread needs to be at least \
                  {MEMORY_BUDGET_NUM_BYTES_MIN}."
             );
             return Err(TantivyError::InvalidArgument(err_msg));
         }
-        if memory_budget_in_bytes_per_thread >= MEMORY_BUDGET_NUM_BYTES_MAX {
+        if options.memory_budget_per_thread >= MEMORY_BUDGET_NUM_BYTES_MAX {
             let err_msg = format!(
                 "The memory arena in bytes per thread cannot exceed {MEMORY_BUDGET_NUM_BYTES_MAX}"
             );
             return Err(TantivyError::InvalidArgument(err_msg));
         }
+        if options.num_worker_threads == 0 {
+            let err_msg = "At least one worker thread is required, got 0".to_string();
+            return Err(TantivyError::InvalidArgument(err_msg));
+        }
+
         let (document_sender, document_receiver) =
             crossbeam_channel::bounded(PIPELINE_MAX_SIZE_IN_DOCS);
 
@@ -291,13 +309,17 @@ impl<D: Document> IndexWriter<D> {
 
         let stamper = Stamper::new(current_opstamp);
 
-        let segment_updater =
-            SegmentUpdater::create(index.clone(), stamper.clone(), &delete_queue.cursor())?;
+        let segment_updater = SegmentUpdater::create(
+            index.clone(),
+            stamper.clone(),
+            &delete_queue.cursor(),
+            options.num_merge_threads,
+        )?;
 
         let mut index_writer = Self {
             _directory_lock: Some(directory_lock),
 
-            memory_budget_in_bytes_per_thread,
+            options: options.clone(),
             index: index.clone(),
             index_writer_status: IndexWriterStatus::from(document_receiver),
             operation_sender: document_sender,
@@ -305,7 +327,6 @@ impl<D: Document> IndexWriter<D> {
             segment_updater,
 
             workers_join_handle: vec![],
-            num_threads,
 
             delete_queue,
 
@@ -398,7 +419,7 @@ impl<D: Document> IndexWriter<D> {
 
         let mut delete_cursor = self.delete_queue.cursor();
 
-        let mem_budget = self.memory_budget_in_bytes_per_thread;
+        let mem_budget = self.options.memory_budget_per_thread;
         let index = self.index.clone();
         let join_handle: JoinHandle<crate::Result<()>> = thread::Builder::new()
             .name(format!("thrd-tantivy-index{}", self.worker_id))
@@ -451,7 +472,7 @@ impl<D: Document> IndexWriter<D> {
     }
 
     fn start_workers(&mut self) -> crate::Result<()> {
-        for _ in 0..self.num_threads {
+        for _ in 0..self.options.num_worker_threads {
             self.add_indexing_worker()?;
         }
         Ok(())
@@ -482,7 +503,7 @@ impl<D: Document> IndexWriter<D> {
     ///     let index = Index::create_in_ram(schema.clone());
     ///
     ///     let mut index_writer = index.writer_with_num_threads(1, 50_000_000)?;
-    ///     index_writer.add_document(doc!(title => "The modern Promotheus"))?;
+    ///     index_writer.add_document(doc!(title => "The modern Prometheus"))?;
     ///     index_writer.commit()?;
     ///
     ///     let clear_res = index_writer.delete_all_documents().unwrap();
@@ -491,7 +512,7 @@ impl<D: Document> IndexWriter<D> {
     ///
     ///     let searcher = index.reader()?.searcher();
     ///     let query_parser = QueryParser::for_index(&index, vec![title]);
-    ///     let query_promo = query_parser.parse_query("Promotheus")?;
+    ///     let query_promo = query_parser.parse_query("Prometheus")?;
     ///     let top_docs_promo = searcher.search(&query_promo, &TopDocs::with_limit(1))?;
     ///
     ///     assert!(top_docs_promo.is_empty());
@@ -553,12 +574,7 @@ impl<D: Document> IndexWriter<D> {
             .take()
             .expect("The IndexWriter does not have any lock. This is a bug, please report.");
 
-        let new_index_writer = IndexWriter::new(
-            &self.index,
-            self.num_threads,
-            self.memory_budget_in_bytes_per_thread,
-            directory_lock,
-        )?;
+        let new_index_writer = IndexWriter::new(&self.index, self.options.clone(), directory_lock)?;
 
         // the current `self` is dropped right away because of this call.
         //
@@ -812,7 +828,7 @@ mod tests {
     use crate::directory::error::LockError;
     use crate::error::*;
     use crate::indexer::index_writer::MEMORY_BUDGET_NUM_BYTES_MIN;
-    use crate::indexer::NoMergePolicy;
+    use crate::indexer::{IndexWriterOptions, NoMergePolicy};
     use crate::query::{QueryParser, TermQuery};
     use crate::schema::{
         self, Facet, FacetOptions, IndexRecordOption, IpAddrOptions, JsonObjectOptions,
@@ -2093,7 +2109,7 @@ mod tests {
         //
         // Take half as sample
         let mut sample: Vec<_> = expected_ids_and_num_occurrences.iter().collect();
-        sample.sort_by_key(|(k, _num_occurences)| *k);
+        sample.sort_by_key(|(k, _num_occurrences)| *k);
         // sample.truncate(sample.len() / 2);
         if !sample.is_empty() {
             let (left_sample, right_sample) = sample.split_at(sample.len() / 2);
@@ -2102,7 +2118,7 @@ mod tests {
                 sample
                     .iter()
                     .filter(|(id, _)| id_is_full_doc(**id))
-                    .map(|(_id, num_occurences)| **num_occurences)
+                    .map(|(_id, num_occurrences)| **num_occurrences)
                     .sum::<u64>()
             };
             fn gen_query_inclusive<T1: ToString, T2: ToString>(
@@ -2532,5 +2548,37 @@ mod tests {
             .unwrap();
         index_writer.commit().unwrap();
         Ok(())
+    }
+
+    #[test]
+    fn test_writer_options_validation() {
+        let mut schema_builder = Schema::builder();
+        let field = schema_builder.add_bool_field("example", STORED);
+        let index = Index::create_in_ram(schema_builder.build());
+
+        let opt_wo_threads = IndexWriterOptions::builder().num_worker_threads(0).build();
+        let result = index.writer_with_options::<TantivyDocument>(opt_wo_threads);
+        assert!(result.is_err(), "Writer should reject 0 thread count");
+        assert!(matches!(result, Err(TantivyError::InvalidArgument(_))));
+
+        let opt_with_low_memory = IndexWriterOptions::builder()
+            .memory_budget_per_thread(10 << 10)
+            .build();
+        let result = index.writer_with_options::<TantivyDocument>(opt_with_low_memory);
+        assert!(
+            result.is_err(),
+            "Writer should reject options with too low memory size"
+        );
+        assert!(matches!(result, Err(TantivyError::InvalidArgument(_))));
+
+        let opt_with_low_memory = IndexWriterOptions::builder()
+            .memory_budget_per_thread(5 << 30)
+            .build();
+        let result = index.writer_with_options::<TantivyDocument>(opt_with_low_memory);
+        assert!(
+            result.is_err(),
+            "Writer should reject options with too high memory size"
+        );
+        assert!(matches!(result, Err(TantivyError::InvalidArgument(_))));
     }
 }

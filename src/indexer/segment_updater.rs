@@ -25,15 +25,11 @@ use crate::indexer::{
 };
 use crate::{FutureResult, Opstamp};
 
-const NUM_MERGE_THREADS: usize = 4;
-
 /// Save the index meta file.
 /// This operation is atomic:
 /// Either
-///  - it fails, in which case an error is returned,
-/// and the `meta.json` remains untouched,
-/// - it success, and `meta.json` is written
-/// and flushed.
+/// - it fails, in which case an error is returned, and the `meta.json` remains untouched,
+/// - it success, and `meta.json` is written and flushed.
 ///
 /// This method is not part of tantivy's public API
 pub(crate) fn save_metas(metas: &IndexMeta, directory: &dyn Directory) -> crate::Result<()> {
@@ -275,6 +271,7 @@ impl SegmentUpdater {
         index: Index,
         stamper: Stamper,
         delete_cursor: &DeleteCursor,
+        num_merge_threads: usize,
     ) -> crate::Result<SegmentUpdater> {
         let segments = index.searchable_segment_metas()?;
         let segment_manager = SegmentManager::from_segments(segments, delete_cursor);
@@ -289,7 +286,7 @@ impl SegmentUpdater {
             })?;
         let merge_thread_pool = ThreadPoolBuilder::new()
             .thread_name(|i| format!("merge_thread_{i}"))
-            .num_threads(NUM_MERGE_THREADS)
+            .num_threads(num_merge_threads)
             .build()
             .map_err(|_| {
                 crate::TantivyError::SystemError(
@@ -379,7 +376,7 @@ impl SegmentUpdater {
         if self.is_alive() {
             let index = &self.index;
             let directory = index.directory();
-            let mut commited_segment_metas = self.segment_manager.committed_segment_metas();
+            let mut committed_segment_metas = self.segment_manager.committed_segment_metas();
 
             // We sort segment_readers by number of documents.
             // This is an heuristic to make multithreading more efficient.
@@ -394,10 +391,10 @@ impl SegmentUpdater {
             // from the different drives.
             //
             // Segment 1 from disk 1, Segment 1 from disk 2, etc.
-            commited_segment_metas.sort_by_key(|segment_meta| -(segment_meta.max_doc() as i32));
+            committed_segment_metas.sort_by_key(|segment_meta| -(segment_meta.max_doc() as i32));
             let index_meta = IndexMeta {
                 index_settings: index.settings().clone(),
-                segments: commited_segment_metas,
+                segments: committed_segment_metas,
                 schema: index.schema(),
                 opstamp,
                 payload: commit_message,
@@ -542,7 +539,13 @@ impl SegmentUpdater {
     }
 
     fn consider_merge_options(&self) {
-        let (committed_segments, uncommitted_segments) = self.get_mergeable_segments();
+        let (mut committed_segments, mut uncommitted_segments) = self.get_mergeable_segments();
+        if committed_segments.len() == 1 && committed_segments[0].num_deleted_docs() == 0 {
+            committed_segments.clear();
+        }
+        if uncommitted_segments.len() == 1 && uncommitted_segments[0].num_deleted_docs() == 0 {
+            uncommitted_segments.clear();
+        }
 
         // Committed segments cannot be merged with uncommitted_segments.
         // We therefore consider merges using these two sets of segments independently.

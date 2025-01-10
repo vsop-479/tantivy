@@ -15,7 +15,9 @@ use crate::directory::MmapDirectory;
 use crate::directory::{Directory, ManagedDirectory, RamDirectory, INDEX_WRITER_LOCK};
 use crate::error::{DataCorruption, TantivyError};
 use crate::index::{IndexMeta, SegmentId, SegmentMeta, SegmentMetaInventory};
-use crate::indexer::index_writer::{MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN};
+use crate::indexer::index_writer::{
+    IndexWriterOptions, MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN,
+};
 use crate::indexer::segment_updater::save_metas;
 use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
 use crate::reader::{IndexReader, IndexReaderBuilder};
@@ -49,10 +51,8 @@ fn load_metas(
 /// Save the index meta file.
 /// This operation is atomic :
 /// Either
-///  - it fails, in which case an error is returned,
-/// and the `meta.json` remains untouched,
-/// - it succeeds, and `meta.json` is written
-/// and flushed.
+/// - it fails, in which case an error is returned, and the `meta.json` remains untouched,
+/// - it succeeds, and `meta.json` is written and flushed.
 ///
 /// This method is not part of tantivy's public API
 fn save_new_metas(
@@ -521,7 +521,7 @@ impl Index {
         load_metas(self.directory(), &self.inventory)
     }
 
-    /// Open a new index writer. Attempts to acquire a lockfile.
+    /// Open a new index writer with the given options. Attempts to acquire a lockfile.
     ///
     /// The lockfile should be deleted on drop, but it is possible
     /// that due to a panic or other error, a stale lockfile will be
@@ -529,21 +529,16 @@ impl Index {
     /// `IndexWriter` on the system is accessing the index directory,
     /// it is safe to manually delete the lockfile.
     ///
-    /// - `num_threads` defines the number of indexing workers that
-    /// should work at the same time.
-    ///
-    /// - `overall_memory_budget_in_bytes` sets the amount of memory
-    /// allocated for all indexing thread.
-    /// Each thread will receive a budget of  `overall_memory_budget_in_bytes / num_threads`.
+    /// - `options` defines the writer configuration which includes things like buffer sizes,
+    ///   indexer threads, etc...
     ///
     /// # Errors
-    /// If the lockfile already exists, returns `Error::DirectoryLockBusy` or an `Error::IoError`.
+    /// If the lockfile already exists, returns `TantivyError::LockFailure`.
     /// If the memory arena per thread is too small or too big, returns
     /// `TantivyError::InvalidArgument`
-    pub fn writer_with_num_threads<D: Document>(
+    pub fn writer_with_options<D: Document>(
         &self,
-        num_threads: usize,
-        overall_memory_budget_in_bytes: usize,
+        options: IndexWriterOptions,
     ) -> crate::Result<IndexWriter<D>> {
         let directory_lock = self
             .directory
@@ -559,13 +554,40 @@ impl Index {
                     ),
                 )
             })?;
+
+        IndexWriter::new(self, options, directory_lock)
+    }
+
+    /// Open a new index writer. Attempts to acquire a lockfile.
+    ///
+    /// The lockfile should be deleted on drop, but it is possible
+    /// that due to a panic or other error, a stale lockfile will be
+    /// left in the index directory. If you are sure that no other
+    /// `IndexWriter` on the system is accessing the index directory,
+    /// it is safe to manually delete the lockfile.
+    ///
+    /// - `num_threads` defines the number of indexing workers that should work at the same time.
+    ///
+    /// - `overall_memory_budget_in_bytes` sets the amount of memory allocated for all indexing
+    ///   thread.
+    ///
+    /// Each thread will receive a budget of `overall_memory_budget_in_bytes / num_threads`.
+    ///
+    /// # Errors
+    /// If the lockfile already exists, returns `Error::DirectoryLockBusy` or an `Error::IoError`.
+    /// If the memory arena per thread is too small or too big, returns
+    /// `TantivyError::InvalidArgument`
+    pub fn writer_with_num_threads<D: Document>(
+        &self,
+        num_threads: usize,
+        overall_memory_budget_in_bytes: usize,
+    ) -> crate::Result<IndexWriter<D>> {
         let memory_arena_in_bytes_per_thread = overall_memory_budget_in_bytes / num_threads;
-        IndexWriter::new(
-            self,
-            num_threads,
-            memory_arena_in_bytes_per_thread,
-            directory_lock,
-        )
+        let options = IndexWriterOptions::builder()
+            .num_worker_threads(num_threads)
+            .memory_budget_per_thread(memory_arena_in_bytes_per_thread)
+            .build();
+        self.writer_with_options(options)
     }
 
     /// Helper to create an index writer for tests.
