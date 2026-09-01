@@ -15,7 +15,7 @@ use crate::schema::field_type::ValueParsingError;
 use crate::schema::{Facet, Field, NamedFieldDocument, OwnedValue, Schema};
 use crate::tokenizer::PreTokenizedString;
 
-#[repr(packed)]
+#[repr(C, packed)]
 #[derive(Debug, Clone)]
 /// A field value pair in the compact tantivy document
 struct FieldValueAddr {
@@ -116,6 +116,14 @@ impl CompactDoc {
     /// Add a bytes field
     pub fn add_bytes(&mut self, field: Field, value: &[u8]) {
         self.add_leaf_field_value(field, value);
+    }
+
+    /// Add a plugin-defined custom field value.
+    ///
+    /// The bytes are an opaque payload owned by the plugin that consumes this field's custom
+    /// type; tantivy never inspects, indexes, or stores them.
+    pub fn add_custom(&mut self, field: Field, value: &[u8]) {
+        self.add_leaf_field_value(field, ReferenceValueLeaf::Custom(value));
     }
 
     /// Add a dynamic object field
@@ -245,6 +253,7 @@ impl CompactDoc {
                 write_bytes_into(&mut self.node_data, bytes.as_bytes())
             }
             ReferenceValueLeaf::Bytes(bytes) => write_bytes_into(&mut self.node_data, bytes),
+            ReferenceValueLeaf::Custom(bytes) => write_bytes_into(&mut self.node_data, bytes),
             ReferenceValueLeaf::U64(num) => write_into(&mut self.node_data, num),
             ReferenceValueLeaf::I64(num) => write_into(&mut self.node_data, num),
             ReferenceValueLeaf::F64(num) => write_into(&mut self.node_data, num),
@@ -432,6 +441,10 @@ impl<'a> CompactDocValue<'a> {
                 let data = self.container.extract_bytes(addr);
                 Ok(ReferenceValueLeaf::Bytes(data).into())
             }
+            ValueType::Custom => {
+                let data = self.container.extract_bytes(addr);
+                Ok(ReferenceValueLeaf::Custom(data).into())
+            }
             ValueType::U64 => self
                 .container
                 .read_from::<u64>(addr)
@@ -480,7 +493,7 @@ impl<'a> CompactDocValue<'a> {
 type Addr = u32;
 
 #[derive(Clone, Copy, Default)]
-#[repr(packed)]
+#[repr(C, packed)]
 /// The value type and the address to its payload in the container.
 struct ValueAddr {
     type_id: ValueType,
@@ -542,6 +555,8 @@ pub enum ValueType {
     Object = 11,
     /// Pre-tokenized str type,
     Array = 12,
+    /// Opaque payload of a plugin-defined custom field.
+    Custom = 13,
 }
 
 impl BinarySerializable for ValueType {
@@ -552,7 +567,7 @@ impl BinarySerializable for ValueType {
 
     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
         let num = u8::deserialize(reader)?;
-        let type_id = if (0..=12).contains(&num) {
+        let type_id = if (0..=13).contains(&num) {
             unsafe { std::mem::transmute::<u8, ValueType>(num) }
         } else {
             return Err(io::Error::new(
@@ -587,6 +602,7 @@ impl<'a> From<&ReferenceValueLeaf<'a>> for ValueType {
             ReferenceValueLeaf::PreTokStr(_) => ValueType::PreTokStr,
             ReferenceValueLeaf::Facet(_) => ValueType::Facet,
             ReferenceValueLeaf::Bytes(_) => ValueType::Bytes,
+            ReferenceValueLeaf::Custom(_) => ValueType::Custom,
         }
     }
 }
@@ -671,6 +687,10 @@ impl Document for CompactDoc {
             container: self,
         }
     }
+
+    fn into_tantivy_document(self) -> TantivyDocument {
+        self
+    }
 }
 
 /// A helper wrapper for creating an iterator over the field values
@@ -734,7 +754,7 @@ mod tests {
 
     #[test]
     fn test_json_value() {
-        let json_str = r#"{ 
+        let json_str = r#"{
             "toto": "titi",
             "float": -0.2,
             "bool": true,

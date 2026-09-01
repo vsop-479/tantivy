@@ -41,10 +41,31 @@ impl ColumnWriter {
     pub(super) fn operation_iterator<'a, V: SymbolValue>(
         &self,
         arena: &MemoryArena,
+        old_to_new_ids_opt: Option<&[RowId]>,
         buffer: &'a mut Vec<u8>,
-    ) -> impl Iterator<Item = ColumnOperation<V>> + 'a {
+    ) -> impl Iterator<Item = ColumnOperation<V>> + 'a + use<'a, V> {
         buffer.clear();
         self.values.read_to_end(arena, buffer);
+        if let Some(old_to_new_ids) = old_to_new_ids_opt {
+            // TODO avoid the extra deserialization / serialization.
+            let mut sorted_ops: Vec<(RowId, ColumnOperation<V>)> = Vec::new();
+            let mut new_doc = 0u32;
+            let mut cursor = &buffer[..];
+            for op in std::iter::from_fn(|| ColumnOperation::<V>::deserialize(&mut cursor)) {
+                if let ColumnOperation::NewDoc(doc) = &op {
+                    new_doc = old_to_new_ids[*doc as usize];
+                    sorted_ops.push((new_doc, ColumnOperation::NewDoc(new_doc)));
+                } else {
+                    sorted_ops.push((new_doc, op));
+                }
+            }
+            // stable sort is crucial here.
+            sorted_ops.sort_by_key(|(new_doc_id, _)| *new_doc_id);
+            buffer.clear();
+            for (_, op) in sorted_ops {
+                buffer.extend_from_slice(op.serialize().as_ref());
+            }
+        }
         let mut cursor: &[u8] = &buffer[..];
         std::iter::from_fn(move || ColumnOperation::deserialize(&mut cursor))
     }
@@ -104,9 +125,10 @@ pub(crate) struct NumericalColumnWriter {
 
 impl NumericalColumnWriter {
     pub fn force_numerical_type(&mut self, numerical_type: NumericalType) {
-        assert!(self
-            .compatible_numerical_types
-            .is_type_accepted(numerical_type));
+        assert!(
+            self.compatible_numerical_types
+                .is_type_accepted(numerical_type)
+        );
         self.compatible_numerical_types = CompatibleNumericalTypes::StaticType(numerical_type);
     }
 }
@@ -210,9 +232,11 @@ impl NumericalColumnWriter {
     pub(super) fn operation_iterator<'a>(
         self,
         arena: &MemoryArena,
+        old_to_new_ids: Option<&[RowId]>,
         buffer: &'a mut Vec<u8>,
-    ) -> impl Iterator<Item = ColumnOperation<NumericalValue>> + 'a {
-        self.column_writer.operation_iterator(arena, buffer)
+    ) -> impl Iterator<Item = ColumnOperation<NumericalValue>> + 'a + use<'a> {
+        self.column_writer
+            .operation_iterator(arena, old_to_new_ids, buffer)
     }
 }
 
@@ -254,9 +278,11 @@ impl StrOrBytesColumnWriter {
     pub(super) fn operation_iterator<'a>(
         &self,
         arena: &MemoryArena,
+        old_to_new_ids: Option<&[RowId]>,
         byte_buffer: &'a mut Vec<u8>,
-    ) -> impl Iterator<Item = ColumnOperation<UnorderedId>> + 'a {
-        self.column_writer.operation_iterator(arena, byte_buffer)
+    ) -> impl Iterator<Item = ColumnOperation<UnorderedId>> + 'a + use<'a> {
+        self.column_writer
+            .operation_iterator(arena, old_to_new_ids, byte_buffer)
     }
 }
 

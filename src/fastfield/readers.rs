@@ -8,7 +8,7 @@ use columnar::{
 };
 use common::ByteCount;
 
-use crate::core::json_utils::encode_column_name;
+use crate::core::json_utils::{encode_column_name, json_path_sep_to_dot};
 use crate::directory::FileSlice;
 use crate::schema::{Field, FieldEntry, FieldType, Schema};
 use crate::space_usage::{FieldUsage, PerFieldSpaceUsage};
@@ -39,19 +39,15 @@ impl FastFieldReaders {
         self.resolve_column_name_given_default_field(column_name, default_field_opt)
     }
 
-    pub(crate) fn space_usage(&self, schema: &Schema) -> io::Result<PerFieldSpaceUsage> {
+    pub(crate) fn space_usage(&self) -> io::Result<PerFieldSpaceUsage> {
         let mut per_field_usages: Vec<FieldUsage> = Default::default();
-        for (field, field_entry) in schema.fields() {
-            let column_handles = self.columnar.read_columns(field_entry.name())?;
-            let num_bytes: ByteCount = column_handles
-                .iter()
-                .map(|column_handle| column_handle.num_bytes())
-                .sum();
-            let mut field_usage = FieldUsage::empty(field);
-            field_usage.add_field_idx(0, num_bytes);
+        for (mut field_name, column_handle) in self.columnar.iter_columns()? {
+            json_path_sep_to_dot(&mut field_name);
+            let space_usage = column_handle.space_usage()?;
+            let mut field_usage = FieldUsage::empty(field_name);
+            field_usage.set_column_usage(space_usage);
             per_field_usages.push(field_usage);
         }
-        // TODO fix space usage for JSON fields.
         Ok(PerFieldSpaceUsage::new(per_field_usages))
     }
 
@@ -388,6 +384,7 @@ mod tests {
     use columnar::ColumnType;
 
     use crate::schema::{JsonObjectOptions, Schema, FAST};
+    use crate::tokenizer::RAW_TOKENIZER_NAME;
     use crate::{Index, IndexWriter, TantivyDocument};
 
     #[test]
@@ -398,7 +395,7 @@ mod tests {
         schema_builder.add_json_field(
             "json_expand_dots_enabled",
             JsonObjectOptions::default()
-                .set_fast(None)
+                .set_fast(RAW_TOKENIZER_NAME)
                 .set_expand_dots_enabled(),
         );
         let dynamic_field = schema_builder.add_json_field("_dyna", FAST);

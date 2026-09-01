@@ -23,14 +23,17 @@ fn create_index(path: &str) {
 fn create_format() {
     let version = INDEX_FORMAT_VERSION.to_string();
     let file_path = path_for_version(&version);
-    if PathBuf::from(file_path.clone()).exists() {
+    if PathBuf::from(file_path.clone())
+        .try_exists()
+        .expect("Failed to check whether the compatibility index exists")
+    {
         return;
     }
     create_index(&file_path);
 }
 
 fn path_for_version(version: &str) -> String {
-    format!("./tests/compat_tests_data/index_v{}/", version)
+    format!("./tests/compat_tests_data/index_v{version}/")
 }
 
 /// feature flag quickwit uses a different dictionary type
@@ -69,7 +72,7 @@ fn assert_date_time_precision(index: &Index, doc_store_precision: DateTimePrecis
         .parse_query("dateformat")
         .expect("Failed to parse query");
     let top_docs = searcher
-        .search(&query, &TopDocs::with_limit(1))
+        .search(&query, &TopDocs::with_limit(1).order_by_score())
         .expect("Search failed");
 
     assert_eq!(top_docs.len(), 1, "Expected 1 search result");

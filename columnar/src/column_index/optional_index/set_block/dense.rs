@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use common::BinarySerializable;
 
-use crate::column_index::optional_index::{SelectCursor, Set, SetCodec, ELEMENTS_PER_BLOCK};
+use crate::column_index::optional_index::{ELEMENTS_PER_BLOCK, SelectCursor, Set, SetCodec};
 
 #[inline(always)]
 fn get_bit_at(input: u64, n: u16) -> bool {
@@ -191,11 +191,13 @@ impl DenseBlock<'_> {
         from_block_id: u16,
     ) -> impl Iterator<Item = (u16, DenseMiniBlock)> + '_ {
         self.0
-            .chunks_exact(MINI_BLOCK_NUM_BYTES)
+            .as_chunks::<MINI_BLOCK_NUM_BYTES>()
+            .0
+            .iter()
             .enumerate()
             .skip(from_block_id as usize)
-            .map(|(block_id, bytes)| {
-                let mini_block = DenseMiniBlock::from_bytes(bytes.try_into().unwrap());
+            .map(|(block_id, &bytes)| {
+                let mini_block = DenseMiniBlock::from_bytes(bytes);
                 (block_id as u16, mini_block)
             })
     }

@@ -8,7 +8,7 @@ use common::{CountingWriter, OwnedBytes};
 use super::optional_index::{open_optional_index, serialize_optional_index};
 use super::{OptionalIndex, SerializableOptionalIndex, Set};
 use crate::column_values::{
-    load_u64_based_column_values, serialize_u64_based_column_values, CodecType, ColumnValues,
+    CodecType, ColumnValues, load_u64_based_column_values, serialize_u64_based_column_values,
 };
 use crate::iterable::Iterable;
 use crate::{DocId, RowId, Version};
@@ -215,6 +215,32 @@ impl MultiValueIndex {
         }
     }
 
+    /// Returns an iterator over document ids that have at least one value.
+    pub fn iter_non_null_docs(&self) -> Box<dyn Iterator<Item = DocId> + '_> {
+        match self {
+            MultiValueIndex::MultiValueIndexV1(idx) => {
+                let mut doc: DocId = 0u32;
+                let num_docs = idx.num_docs();
+                Box::new(std::iter::from_fn(move || {
+                    // This is not the most efficient way to do this, but it's legacy code.
+                    while doc < num_docs {
+                        let cur = doc;
+                        doc += 1;
+                        let start = idx.start_index_column.get_val(cur);
+                        let end = idx.start_index_column.get_val(cur + 1);
+                        if end > start {
+                            return Some(cur);
+                        }
+                    }
+                    None
+                }))
+            }
+            MultiValueIndex::MultiValueIndexV2(idx) => {
+                Box::new(idx.optional_index.iter_non_null_docs())
+            }
+        }
+    }
+
     /// Converts a list of ranks (row ids of values) in a 1:n index to the corresponding list of
     /// docids. Positions are converted inplace to docids.
     ///
@@ -349,7 +375,7 @@ mod tests {
         columnar_writer.record_numerical(5, "full", u64::MAX);
 
         let mut wrt: Vec<u8> = Vec::new();
-        columnar_writer.serialize(7, &mut wrt).unwrap();
+        columnar_writer.serialize(7, None, &mut wrt).unwrap();
 
         let reader = ColumnarReader::open(wrt).unwrap();
         // Open the column as u64

@@ -1,12 +1,105 @@
-Tantivy 0.23 - Unreleased
+Tantivy 0.27.0
 ================================
-Tantivy 0.23 will be backwards compatible with indices created with v0.22 and v0.21. The new minimum rust version will be 1.75.
+
+## Breaking change
+- `.set_fast(..)` now takes a &str. The same behavior as `.set_fast(None)` can be obtained with .set_fast(tantivy::tokenizer::RAW_TOKENIZER_NAME).
+
+
+Tantivy 0.26.1
+================================
+
+## Performance
+- Fix quadratic runtime in nested term and composite aggregations: memory accounting scanned all parent buckets on every collect instead of just the current parent (@PSeitz @fulmicoton)
+
+Tantivy 0.26 (Unreleased)
+================================
+
+## Bugfixes
+- Align float query coercion during search with the columnar coercion rules [#2692](https://github.com/quickwit-oss/tantivy/pull/2692)(@fulmicoton)
+- Fix lenient elastic range queries with trailing closing parentheses [#2816](https://github.com/quickwit-oss/tantivy/pull/2816)(@evance-br)
+- Fix intersection `seek()` advancing below current doc id [#2812](https://github.com/quickwit-oss/tantivy/pull/2812)(@fulmicoton)
+- Fix phrase query prefixed with `*` [#2751](https://github.com/quickwit-oss/tantivy/pull/2751)(@Darkheir)
+- Fix `vint` buffer overflow during index creation [#2778](https://github.com/quickwit-oss/tantivy/pull/2778)(@rebasedming)
+- Fix integer overflow in `ExpUnrolledLinkedList` for large datasets [#2735](https://github.com/quickwit-oss/tantivy/pull/2735)(@mdashti)
+- Fix integer overflow in segment sorting and merge policy truncation [#2846](https://github.com/quickwit-oss/tantivy/pull/2846)(@anaslimem)
+- Fix merging of intermediate aggregation results [#2719](https://github.com/quickwit-oss/tantivy/pull/2719)(@PSeitz)
+- Fix deduplicate doc counts in term aggregation for multi-valued fields [#2854](https://github.com/quickwit-oss/tantivy/pull/2854)(@nuri-yoo)
+- Honor phrase prefix (`"..."*`) and slop (`"..."~N`) on JSON fields; previously both were silently dropped, degrading the query to an exact phrase [#2966](https://github.com/quickwit-oss/tantivy/pull/2966)(@DavIvek)
+
+## Features/Improvements
+- **Aggregation**
+    - Add filter aggregation [#2711](https://github.com/quickwit-oss/tantivy/pull/2711)(@mdashti)
+    - Add include/exclude filtering for term aggregations [#2717](https://github.com/quickwit-oss/tantivy/pull/2717)(@PSeitz)
+    - Add public accessors for intermediate aggregation results [#2829](https://github.com/quickwit-oss/tantivy/pull/2829)(@congx4)
+    - Replace HyperLogLog++ with Apache DataSketches HLL for cardinality aggregation [#2837](https://github.com/quickwit-oss/tantivy/pull/2837) [#2842](https://github.com/quickwit-oss/tantivy/pull/2842)(@congx4)
+    - Add composite aggregation [#2856](https://github.com/quickwit-oss/tantivy/pull/2856)(@fulmicoton)
+- **Fast Fields**
+    - Add fast field fallback for `TermQuery` when the field is not indexed [#2693](https://github.com/quickwit-oss/tantivy/pull/2693)(@PSeitz-dd)
+    - Add fast field support for `Bytes` values [#2830](https://github.com/quickwit-oss/tantivy/pull/2830)(@mdashti)
+- **Query Parser**
+    - Add support for regexes in the query grammar [#2677](https://github.com/quickwit-oss/tantivy/pull/2677) [#2818](https://github.com/quickwit-oss/tantivy/pull/2818)(@Darkheir)
+    - Deduplicate queries in query parser [#2698](https://github.com/quickwit-oss/tantivy/pull/2698)(@PSeitz-dd)
+- Add erased `SortKeyComputer` for sorting on column types unknown until runtime [#2770](https://github.com/quickwit-oss/tantivy/pull/2770) [#2790](https://github.com/quickwit-oss/tantivy/pull/2790)(@stuhood @PSeitz)
+- Add natural-order-with-none-highest support in `TopDocs::order_by` [#2780](https://github.com/quickwit-oss/tantivy/pull/2780)(@stuhood)
+- Move stemming behing `stemmer` feature flag [#2791](https://github.com/quickwit-oss/tantivy/pull/2791)(@fulmicoton)
+- Make `DeleteMeta`, `AddOperation`, `advance_deletes`, `with_max_doc`, `serializer` module, and `delete_queue` public [#2762](https://github.com/quickwit-oss/tantivy/pull/2762) [#2765](https://github.com/quickwit-oss/tantivy/pull/2765) [#2766](https://github.com/quickwit-oss/tantivy/pull/2766) [#2835](https://github.com/quickwit-oss/tantivy/pull/2835)(@philippemnoel @PSeitz)
+- Make `Language` hashable [#2763](https://github.com/quickwit-oss/tantivy/pull/2763)(@philippemnoel)
+- Improve `space_usage` reporting for JSON fields and columnar data [#2761](https://github.com/quickwit-oss/tantivy/pull/2761)(@PSeitz-dd)
+- Split `Term` into `Term` and `IndexingTerm` [#2744](https://github.com/quickwit-oss/tantivy/pull/2744) [#2750](https://github.com/quickwit-oss/tantivy/pull/2750)(@PSeitz-dd @PSeitz)
+
+## Performance
+- **Aggregation**
+    - Large speed up and memory reduction for nested high cardinality aggregations by using one collector per request instead of one per bucket, and adding `PagedTermMap` for faster medium cardinality term aggregations [#2715](https://github.com/quickwit-oss/tantivy/pull/2715) [#2759](https://github.com/quickwit-oss/tantivy/pull/2759)(@PSeitz @PSeitz-dd)
+    - Optimize low-cardinality term aggregations by using a `Vec` instead of a `HashMap` [#2740](https://github.com/quickwit-oss/tantivy/pull/2740)(@fulmicoton-dd)
+- Optimize `ExistsQuery` for a high number of dynamic columns [#2694](https://github.com/quickwit-oss/tantivy/pull/2694)(@PSeitz-dd)
+- Add lazy scorers to stop score evaluation early when a doc won't reach the top-K threshold [#2726](https://github.com/quickwit-oss/tantivy/pull/2726) [#2777](https://github.com/quickwit-oss/tantivy/pull/2777)(@fulmicoton @stuhood)
+- Add `DocSet::cost()` and use it to order scorers in intersections [#2707](https://github.com/quickwit-oss/tantivy/pull/2707)(@PSeitz)
+- Add `collect_block` support for collector wrappers [#2727](https://github.com/quickwit-oss/tantivy/pull/2727)(@stuhood)
+- Optimize saturated posting lists by replacing them with `AllScorer` in boolean queries [#2745](https://github.com/quickwit-oss/tantivy/pull/2745) [#2760](https://github.com/quickwit-oss/tantivy/pull/2760) [#2774](https://github.com/quickwit-oss/tantivy/pull/2774)(@fulmicoton @mdashti @trinity-1686a)
+- Add `seek_danger` on `DocSet` for more efficient intersections [#2538](https://github.com/quickwit-oss/tantivy/pull/2538) [#2810](https://github.com/quickwit-oss/tantivy/pull/2810)(@PSeitz @stuhood @fulmicoton)
+- Skip column traversal in `RangeDocSet` when query range does not overlap with column bounds [#2783](https://github.com/quickwit-oss/tantivy/pull/2783)(@ChangRui-Ryan)
+- Speed up exclude queries by supporting multiple excluded `DocSet`s without intermediate union [#2825](https://github.com/quickwit-oss/tantivy/pull/2825)(@PSeitz)
+- Improve union performance for non-score unions with `fill_buffer` and optimized `TinySet` [#2863](https://github.com/quickwit-oss/tantivy/pull/2863)(@PSeitz)
+
+Tantivy 0.25
+================================
+
+## Bugfixes
+- fix union performance regression in tantivy 0.24 [#2663](https://github.com/quickwit-oss/tantivy/pull/2663)(@PSeitz)
+- make zstd optional in sstable [#2633](https://github.com/quickwit-oss/tantivy/pull/2633)(@Parth)
+- Fix TopDocs::order_by_string_fast_field for asc order [#2672](https://github.com/quickwit-oss/tantivy/pull/2672)(@stuhood @PSeitz)
+
+## Features/Improvements
+- add docs/example and Vec<u32> values to sstable [#2660](https://github.com/quickwit-oss/tantivy/pull/2660)(@PSeitz)
+- Add string fast field support to `TopDocs`. [#2642](https://github.com/quickwit-oss/tantivy/pull/2642)(@stuhood)
+- update edition to 2024 [#2620](https://github.com/quickwit-oss/tantivy/pull/2620)(@PSeitz)
+- Allow optional spaces between the field name and the value in the query parser [#2678](https://github.com/quickwit-oss/tantivy/pull/2678)(@Darkheir)
+- Support mixed field types in query parser [#2676](https://github.com/quickwit-oss/tantivy/pull/2676)(@trinity-1686a)
+- Add per-field size details [#2679](https://github.com/quickwit-oss/tantivy/pull/2679)(@fulmicoton)
+
+Tantivy 0.24.2
+================================
+- Fix TopNComputer for reverse order. [#2672](https://github.com/quickwit-oss/tantivy/pull/2672)(@stuhood @PSeitz) 
+
+Affected queries are [order_by_fast_field](https://docs.rs/tantivy/latest/tantivy/collector/struct.TopDocs.html#method.order_by_fast_field) and
+[order_by_u64_field](https://docs.rs/tantivy/latest/tantivy/collector/struct.TopDocs.html#method.order_by_u64_field)
+for `Order::Asc`
+
+Tantivy 0.24.1
+================================
+- Fix: bump required rust version to 1.81
+  
+Tantivy 0.24
+================================
+Tantivy 0.24 will be backwards compatible with indices created with v0.22 and v0.21. The new minimum rust version will be 1.75. Tantivy 0.23 will be skipped.
 
 #### Bugfixes
 - fix potential endless loop in merge [#2457](https://github.com/quickwit-oss/tantivy/pull/2457)(@PSeitz)
 - fix bug that causes out-of-order sstable key. [#2445](https://github.com/quickwit-oss/tantivy/pull/2445)(@fulmicoton)
 - fix ReferenceValue API flaw [#2372](https://github.com/quickwit-oss/tantivy/pull/2372)(@PSeitz)
 - fix `OwnedBytes` debug panic [#2512](https://github.com/quickwit-oss/tantivy/pull/2512)(@b41sh)
+- catch panics during merges [#2582](https://github.com/quickwit-oss/tantivy/pull/2582)(@rdettai)
+- switch from u32 to usize in bitpacker. This enables multivalued columns larger than 4GB, which crashed during merge before. [#2581](https://github.com/quickwit-oss/tantivy/pull/2581) [#2586](https://github.com/quickwit-oss/tantivy/pull/2586)(@fulmicoton-dd @PSeitz)
 
 #### Breaking API Changes
 - remove index sorting [#2434](https://github.com/quickwit-oss/tantivy/pull/2434)(@PSeitz)
@@ -24,6 +117,7 @@ Tantivy 0.23 will be backwards compatible with indices created with v0.22 and v0
     - reduce top hits memory consumption [#2426](https://github.com/quickwit-oss/tantivy/pull/2426)(@PSeitz)
     - check unsupported parameters top_hits [#2351](https://github.com/quickwit-oss/tantivy/pull/2351)(@PSeitz)
     - Change AggregationLimits to AggregationLimitsGuard [#2495](https://github.com/quickwit-oss/tantivy/pull/2495)(@PSeitz)
+    - add support for counting non integer in aggregation [#2547](https://github.com/quickwit-oss/tantivy/pull/2547)(@trinity-1686a)
 - **Range Queries**
     - Support fast field range queries on json fields [#2456](https://github.com/quickwit-oss/tantivy/pull/2456)(@PSeitz)
     - Add support for str fast field range query [#2460](https://github.com/quickwit-oss/tantivy/pull/2460) [#2452](https://github.com/quickwit-oss/tantivy/pull/2452) [#2453](https://github.com/quickwit-oss/tantivy/pull/2453)(@PSeitz)
@@ -34,7 +128,8 @@ Tantivy 0.23 will be backwards compatible with indices created with v0.22 and v0
 - add columnar format compatibility tests [#2433](https://github.com/quickwit-oss/tantivy/pull/2433)(@PSeitz)
 - Improved snippet ranges algorithm [#2474](https://github.com/quickwit-oss/tantivy/pull/2474)(@gezihuzi)
 - make find_field_with_default return json fields without path [#2476](https://github.com/quickwit-oss/tantivy/pull/2476)(@trinity-1686a)
-- feat(query): Make `BooleanQuery` support `minimum_number_should_match` [#2405](https://github.com/quickwit-oss/tantivy/pull/2405)(@LebranceBW)
+- Make `BooleanQuery` support `minimum_number_should_match` [#2405](https://github.com/quickwit-oss/tantivy/pull/2405)(@LebranceBW)
+- Make `NUM_MERGE_THREADS` configurable [#2535](https://github.com/quickwit-oss/tantivy/pull/2535)(@Barre)
 
 - **RegexPhraseQuery** 
 `RegexPhraseQuery` supports phrase queries with regex. E.g. query "b.* b.* wolf" matches "big bad wolf". Slop is supported as well: "b.* wolf"~2 matches "big bad wolf" [#2516](https://github.com/quickwit-oss/tantivy/pull/2516)(@PSeitz)
@@ -46,7 +141,7 @@ This will slightly increase space and access time. [#2439](https://github.com/qu
 
 - **Store DateTime as nanoseconds in doc store** DateTime in the doc store was truncated to microseconds previously. This removes this truncation, while still keeping backwards compatibility. [#2486](https://github.com/quickwit-oss/tantivy/pull/2486)(@PSeitz)
 
-- **Performace/Memory**
+- **Performance/Memory**
     - lift clauses in LogicalAst for optimized ast during execution [#2449](https://github.com/quickwit-oss/tantivy/pull/2449)(@PSeitz)
     - Use Vec instead of BTreeMap to back OwnedValue object [#2364](https://github.com/quickwit-oss/tantivy/pull/2364)(@fulmicoton)
     - Replace TantivyDocument with CompactDoc. CompactDoc is much smaller and provides similar performance. [#2402](https://github.com/quickwit-oss/tantivy/pull/2402)(@PSeitz)
@@ -60,7 +155,9 @@ This will slightly increase space and access time. [#2439](https://github.com/qu
     - fix de-escaping too much in query parser [#2427](https://github.com/quickwit-oss/tantivy/pull/2427)(@trinity-1686a)
     - improve query parser [#2416](https://github.com/quickwit-oss/tantivy/pull/2416)(@trinity-1686a)
     - Support field grouping `title:(return AND "pink panther")` [#2333](https://github.com/quickwit-oss/tantivy/pull/2333)(@trinity-1686a)
+    - allow term starting with wildcard [#2568](https://github.com/quickwit-oss/tantivy/pull/2568)(@trinity-1686a)
 
+- Exist queries match subpath fields [#2558](https://github.com/quickwit-oss/tantivy/pull/2558)(@rdettai)
 - add access benchmark for columnar [#2432](https://github.com/quickwit-oss/tantivy/pull/2432)(@PSeitz)
 - extend indexwriter proptests [#2342](https://github.com/quickwit-oss/tantivy/pull/2342)(@PSeitz)
 - add bench & test for columnar merging [#2428](https://github.com/quickwit-oss/tantivy/pull/2428)(@PSeitz)
@@ -73,6 +170,14 @@ This will slightly increase space and access time. [#2439](https://github.com/qu
 - validate sort by field type [#2336](https://github.com/quickwit-oss/tantivy/pull/2336)(@PSeitz)
 - Fix trait bound of StoreReader::iter [#2360](https://github.com/quickwit-oss/tantivy/pull/2360)(@adamreichold)
 - remove read_postings_no_deletes [#2526](https://github.com/quickwit-oss/tantivy/pull/2526)(@PSeitz)
+
+Tantivy 0.22.1
+================================
+- Fix TopNComputer for reverse order. [#2672](https://github.com/quickwit-oss/tantivy/pull/2672)(@stuhood @PSeitz) 
+
+Affected queries are [order_by_fast_field](https://docs.rs/tantivy/latest/tantivy/collector/struct.TopDocs.html#method.order_by_fast_field) and
+[order_by_u64_field](https://docs.rs/tantivy/latest/tantivy/collector/struct.TopDocs.html#method.order_by_u64_field)
+for `Order::Asc`
 
 Tantivy 0.22
 ================================

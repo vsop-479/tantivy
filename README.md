@@ -1,6 +1,7 @@
 [![Docs](https://docs.rs/tantivy/badge.svg)](https://docs.rs/crate/tantivy/)
 [![Build Status](https://github.com/quickwit-oss/tantivy/actions/workflows/test.yml/badge.svg)](https://github.com/quickwit-oss/tantivy/actions/workflows/test.yml)
 [![codecov](https://codecov.io/gh/quickwit-oss/tantivy/branch/main/graph/badge.svg)](https://codecov.io/gh/quickwit-oss/tantivy)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/quickwit-oss/tantivy/badge)](https://scorecard.dev/viewer/?uri=github.com/quickwit-oss/tantivy)
 [![Join the chat at https://discord.gg/MT27AG5EVE](https://shields.io/discord/908281611840282624?label=chat%20on%20discord)](https://discord.gg/MT27AG5EVE)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Crates.io](https://img.shields.io/crates/v/tantivy.svg)](https://crates.io/crates/tantivy)
@@ -22,8 +23,6 @@ The following [benchmark](https://tantivy-search.github.io/bench/) breaks down t
 performance for different types of queries/collections.
 
 Your mileage WILL vary depending on the nature of queries and their load.
-
-<img src="doc/assets/images/searchbenchmark.png">
 
 Details about the benchmark can be found at this [repository](https://github.com/quickwit-oss/search-benchmark-game).
 
@@ -125,6 +124,7 @@ You can also find other bindings on [GitHub](https://github.com/search?q=tantivy
 - [seshat](https://github.com/matrix-org/seshat/): A matrix message database/indexer
 - [tantiny](https://github.com/baygeldin/tantiny): Tiny full-text search for Ruby
 - [lnx](https://github.com/lnx-search/lnx): adaptable, typo tolerant search engine with a REST API
+- [Bichon](https://github.com/rustmailer/bichon): A lightweight, high-performance Rust email archiver with WebUI
 - and [more](https://github.com/search?q=tantivy)!
 
 ### On average, how much faster is Tantivy compared to Lucene?

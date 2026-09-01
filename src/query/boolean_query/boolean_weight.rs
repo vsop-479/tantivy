@@ -9,13 +9,14 @@ use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
 use crate::query::term_query::TermScorer;
 use crate::query::weight::{for_each_docset_buffered, for_each_pruning_scorer, for_each_scorer};
 use crate::query::{
-    intersect_scorers, BufferedUnionScorer, EmptyScorer, Exclude, Explanation, Occur,
+    intersect_scorers, AllScorer, BufferedUnionScorer, EmptyScorer, Exclude, Explanation, Occur,
     RequiredOptionalScorer, Scorer, Weight,
 };
 use crate::{DocId, Score};
 
 enum SpecializedScorer {
     TermUnion(Vec<TermScorer>),
+    TermIntersection(Vec<TermScorer>),
     Other(Box<dyn Scorer>),
 }
 
@@ -39,18 +40,19 @@ where
     ))
 }
 
+/// num_docs is the number of documents in the segment.
 fn scorer_union<TScoreCombiner>(
     scorers: Vec<Box<dyn Scorer>>,
     score_combiner_fn: impl Fn() -> TScoreCombiner,
+    num_docs: u32,
 ) -> SpecializedScorer
 where
     TScoreCombiner: ScoreCombiner,
 {
     assert!(!scorers.is_empty());
-    if scorers.len() == 1 {
+    if scorers.len() == 1 && !scorers[0].is::<TermScorer>() {
         return SpecializedScorer::Other(scorers.into_iter().next().unwrap()); //< we checked the size beforehand
     }
-
     {
         let is_all_term_queries = scorers.iter().all(|scorer| scorer.is::<TermScorer>());
         if is_all_term_queries {
@@ -64,10 +66,14 @@ where
             {
                 // Block wand is only available if we read frequencies.
                 return SpecializedScorer::TermUnion(scorers);
+            } else if scorers.len() == 1 {
+                // Single TermScorer without freq reading — unwrap directly.
+                return SpecializedScorer::Other(Box::new(scorers.into_iter().next().unwrap()));
             } else {
                 return SpecializedScorer::Other(Box::new(BufferedUnionScorer::build(
                     scorers,
                     score_combiner_fn,
+                    num_docs,
                 )));
             }
         }
@@ -75,20 +81,102 @@ where
     SpecializedScorer::Other(Box::new(BufferedUnionScorer::build(
         scorers,
         score_combiner_fn,
+        num_docs,
     )))
 }
 
 fn into_box_scorer<TScoreCombiner: ScoreCombiner>(
     scorer: SpecializedScorer,
     score_combiner_fn: impl Fn() -> TScoreCombiner,
+    num_docs: u32,
 ) -> Box<dyn Scorer> {
     match scorer {
-        SpecializedScorer::TermUnion(term_scorers) => {
-            let union_scorer = BufferedUnionScorer::build(term_scorers, score_combiner_fn);
-            Box::new(union_scorer)
+        SpecializedScorer::TermUnion(mut term_scorers) => {
+            if term_scorers.len() == 1 {
+                Box::new(term_scorers.pop().unwrap())
+            } else {
+                let union_scorer =
+                    BufferedUnionScorer::build(term_scorers, score_combiner_fn, num_docs);
+                Box::new(union_scorer)
+            }
+        }
+        SpecializedScorer::TermIntersection(term_scorers) => {
+            let boxed_scorers: Vec<Box<dyn Scorer>> = term_scorers
+                .into_iter()
+                .map(|s| Box::new(s) as Box<dyn Scorer>)
+                .collect();
+            intersect_scorers(boxed_scorers, num_docs)
         }
         SpecializedScorer::Other(scorer) => scorer,
     }
+}
+
+/// Returns the effective MUST scorer, accounting for removed AllScorers.
+///
+/// When AllScorer instances are removed from must_scorers as an optimization,
+/// we must restore the "match all" semantics if the list becomes empty.
+fn effective_must_scorer(
+    must_scorers: Vec<Box<dyn Scorer>>,
+    removed_all_scorer_count: usize,
+    max_doc: DocId,
+    num_docs: u32,
+) -> Option<Box<dyn Scorer>> {
+    if must_scorers.is_empty() {
+        if removed_all_scorer_count > 0 {
+            // Had AllScorer(s) only - all docs match
+            Some(Box::new(AllScorer::new(max_doc)))
+        } else {
+            // No MUST constraint at all
+            None
+        }
+    } else {
+        Some(intersect_scorers(must_scorers, num_docs))
+    }
+}
+
+/// Returns a SHOULD scorer with AllScorer union if any were removed.
+///
+/// For union semantics (OR): if any SHOULD clause was an AllScorer, the result
+/// should include all documents. We restore this by unioning with AllScorer.
+///
+/// When `scoring_enabled` is false, we can just return AllScorer alone since
+/// we don't need score contributions from the should_scorer.
+fn effective_should_scorer_for_union<TScoreCombiner: ScoreCombiner>(
+    should_scorer: SpecializedScorer,
+    removed_all_scorer_count: usize,
+    max_doc: DocId,
+    num_docs: u32,
+    score_combiner_fn: impl Fn() -> TScoreCombiner,
+    scoring_enabled: bool,
+) -> SpecializedScorer {
+    if removed_all_scorer_count > 0 {
+        if scoring_enabled {
+            // Need to union to get score contributions from both
+            let all_scorers: Vec<Box<dyn Scorer>> = vec![
+                into_box_scorer(should_scorer, &score_combiner_fn, num_docs),
+                Box::new(AllScorer::new(max_doc)),
+            ];
+            SpecializedScorer::Other(Box::new(BufferedUnionScorer::build(
+                all_scorers,
+                score_combiner_fn,
+                num_docs,
+            )))
+        } else {
+            // Scoring disabled - AllScorer alone is sufficient
+            SpecializedScorer::Other(Box::new(AllScorer::new(max_doc)))
+        }
+    } else {
+        should_scorer
+    }
+}
+
+enum ShouldScorersCombinationMethod {
+    // Should scorers are irrelevant.
+    Ignored,
+    // Only contributes to final score.
+    Optional(SpecializedScorer),
+    // Regardless of score, the should scorers may impact whether a document is matching or not.
+    Required(SpecializedScorer),
 }
 
 /// Weight associated to the `BoolQuery`.
@@ -151,104 +239,225 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         boost: Score,
         score_combiner_fn: impl Fn() -> TComplexScoreCombiner,
     ) -> crate::Result<SpecializedScorer> {
+        let num_docs = reader.num_docs();
         let mut per_occur_scorers = self.per_occur_scorers(reader, boost)?;
-        // Indicate how should clauses are combined with other clauses.
-        enum CombinationMethod {
-            Ignored,
-            // Only contributes to final score.
-            Optional(SpecializedScorer),
-            // Must be fitted.
-            Required(Box<dyn Scorer>),
+
+        // Indicate how should clauses are combined with must clauses.
+        let mut must_scorers: Vec<Box<dyn Scorer>> =
+            per_occur_scorers.remove(&Occur::Must).unwrap_or_default();
+        let must_special_scorer_counts = remove_and_count_all_and_empty_scorers(&mut must_scorers);
+
+        if must_special_scorer_counts.num_empty_scorers > 0 {
+            return Ok(SpecializedScorer::Other(Box::new(EmptyScorer)));
         }
-        let mut must_scorers = per_occur_scorers.remove(&Occur::Must);
-        let should_opt = if let Some(mut should_scorers) = per_occur_scorers.remove(&Occur::Should)
-        {
+
+        let mut should_scorers = per_occur_scorers.remove(&Occur::Should).unwrap_or_default();
+        let should_special_scorer_counts =
+            remove_and_count_all_and_empty_scorers(&mut should_scorers);
+
+        let mut exclude_scorers: Vec<Box<dyn Scorer>> = per_occur_scorers
+            .remove(&Occur::MustNot)
+            .unwrap_or_default();
+        let exclude_special_scorer_counts =
+            remove_and_count_all_and_empty_scorers(&mut exclude_scorers);
+
+        if exclude_special_scorer_counts.num_all_scorers > 0 {
+            // We exclude all documents at one point.
+            return Ok(SpecializedScorer::Other(Box::new(EmptyScorer)));
+        }
+
+        let effective_minimum_number_should_match = self
+            .minimum_number_should_match
+            .saturating_sub(should_special_scorer_counts.num_all_scorers);
+
+        let should_scorers: ShouldScorersCombinationMethod = {
             let num_of_should_scorers = should_scorers.len();
-            if self.minimum_number_should_match > num_of_should_scorers {
+            if effective_minimum_number_should_match > num_of_should_scorers {
+                // We don't have enough scorers to satisfy the minimum number of should matches.
+                // The request will match no documents.
                 return Ok(SpecializedScorer::Other(Box::new(EmptyScorer)));
             }
-            match self.minimum_number_should_match {
-                0 => CombinationMethod::Optional(scorer_union(should_scorers, &score_combiner_fn)),
-                1 => CombinationMethod::Required(into_box_scorer(
-                    scorer_union(should_scorers, &score_combiner_fn),
+            match effective_minimum_number_should_match {
+                0 if num_of_should_scorers == 0 => ShouldScorersCombinationMethod::Ignored,
+                0 => ShouldScorersCombinationMethod::Optional(scorer_union(
+                    should_scorers,
                     &score_combiner_fn,
+                    num_docs,
+                )),
+                1 => ShouldScorersCombinationMethod::Required(scorer_union(
+                    should_scorers,
+                    &score_combiner_fn,
+                    num_docs,
                 )),
                 n if num_of_should_scorers == n => {
                     // When num_of_should_scorers equals the number of should clauses,
                     // they are no different from must clauses.
-                    must_scorers = match must_scorers.take() {
-                        Some(mut must_scorers) => {
-                            must_scorers.append(&mut should_scorers);
-                            Some(must_scorers)
-                        }
-                        None => Some(should_scorers),
-                    };
-                    CombinationMethod::Ignored
+                    must_scorers.append(&mut should_scorers);
+                    ShouldScorersCombinationMethod::Ignored
                 }
-                _ => CombinationMethod::Required(scorer_disjunction(
-                    should_scorers,
-                    score_combiner_fn(),
-                    self.minimum_number_should_match,
+                _ => ShouldScorersCombinationMethod::Required(SpecializedScorer::Other(
+                    scorer_disjunction(
+                        should_scorers,
+                        score_combiner_fn(),
+                        effective_minimum_number_should_match,
+                    ),
                 )),
             }
-        } else {
-            // None of should clauses are provided.
-            if self.minimum_number_should_match > 0 {
-                return Ok(SpecializedScorer::Other(Box::new(EmptyScorer)));
-            } else {
-                CombinationMethod::Ignored
-            }
         };
-        let exclude_scorer_opt: Option<Box<dyn Scorer>> = per_occur_scorers
-            .remove(&Occur::MustNot)
-            .map(|scorers| scorer_union(scorers, DoNothingCombiner::default))
-            .map(|specialized_scorer: SpecializedScorer| {
-                into_box_scorer(specialized_scorer, DoNothingCombiner::default)
-            });
-        let positive_scorer = match (should_opt, must_scorers) {
-            (CombinationMethod::Ignored, Some(must_scorers)) => {
-                SpecializedScorer::Other(intersect_scorers(must_scorers))
-            }
-            (CombinationMethod::Optional(should_scorer), Some(must_scorers)) => {
-                let must_scorer = intersect_scorers(must_scorers);
-                if self.scoring_enabled {
-                    SpecializedScorer::Other(Box::new(
-                        RequiredOptionalScorer::<_, _, TScoreCombiner>::new(
-                            must_scorer,
-                            into_box_scorer(should_scorer, &score_combiner_fn),
-                        ),
-                    ))
+
+        let include_scorer = match (should_scorers, must_scorers) {
+            (ShouldScorersCombinationMethod::Ignored, must_scorers) => {
+                // No SHOULD clauses (or they were absorbed into MUST).
+                // Result depends entirely on MUST + any removed AllScorers.
+                let combined_all_scorer_count = must_special_scorer_counts.num_all_scorers
+                    + should_special_scorer_counts.num_all_scorers;
+
+                // Try to detect a pure TermScorer intersection for block-max optimization.
+                // Preconditions: no removed AllScorers, at least 2 scorers, all TermScorer
+                // with frequency reading enabled.
+                if combined_all_scorer_count == 0
+                    && must_scorers.len() >= 2
+                    && must_scorers.iter().all(|s| s.is::<TermScorer>())
+                {
+                    let term_scorers: Vec<TermScorer> = must_scorers
+                        .into_iter()
+                        .map(|s| *(s.downcast::<TermScorer>().map_err(|_| ()).unwrap()))
+                        .collect();
+                    if term_scorers
+                        .iter()
+                        .all(|s| s.freq_reading_option() == FreqReadingOption::ReadFreq)
+                    {
+                        SpecializedScorer::TermIntersection(term_scorers)
+                    } else {
+                        let must_scorers: Vec<Box<dyn Scorer>> = term_scorers
+                            .into_iter()
+                            .map(|s| Box::new(s) as Box<dyn Scorer>)
+                            .collect();
+                        let boxed_scorer: Box<dyn Scorer> =
+                            effective_must_scorer(must_scorers, 0, reader.max_doc(), num_docs)
+                                .unwrap_or_else(|| Box::new(EmptyScorer));
+                        SpecializedScorer::Other(boxed_scorer)
+                    }
                 } else {
-                    SpecializedScorer::Other(must_scorer)
+                    let boxed_scorer: Box<dyn Scorer> = effective_must_scorer(
+                        must_scorers,
+                        combined_all_scorer_count,
+                        reader.max_doc(),
+                        num_docs,
+                    )
+                    .unwrap_or_else(|| Box::new(EmptyScorer));
+                    SpecializedScorer::Other(boxed_scorer)
                 }
             }
-            (CombinationMethod::Required(should_scorer), Some(mut must_scorers)) => {
-                must_scorers.push(should_scorer);
-                SpecializedScorer::Other(intersect_scorers(must_scorers))
+            (ShouldScorersCombinationMethod::Optional(should_scorer), must_scorers) => {
+                // Optional SHOULD: contributes to scoring but not required for matching.
+                match effective_must_scorer(
+                    must_scorers,
+                    must_special_scorer_counts.num_all_scorers,
+                    reader.max_doc(),
+                    num_docs,
+                ) {
+                    None => {
+                        // No MUST constraint: promote SHOULD to required.
+                        // Must preserve any removed AllScorers from SHOULD via union.
+                        effective_should_scorer_for_union(
+                            should_scorer,
+                            should_special_scorer_counts.num_all_scorers,
+                            reader.max_doc(),
+                            num_docs,
+                            &score_combiner_fn,
+                            self.scoring_enabled,
+                        )
+                    }
+                    Some(must_scorer) => {
+                        // Has MUST constraint: SHOULD only affects scoring.
+                        if self.scoring_enabled {
+                            SpecializedScorer::Other(Box::new(RequiredOptionalScorer::<
+                                _,
+                                _,
+                                TScoreCombiner,
+                            >::new(
+                                must_scorer,
+                                into_box_scorer(should_scorer, &score_combiner_fn, num_docs),
+                            )))
+                        } else {
+                            SpecializedScorer::Other(must_scorer)
+                        }
+                    }
+                }
             }
-            (CombinationMethod::Ignored, None) => {
-                return Ok(SpecializedScorer::Other(Box::new(EmptyScorer)))
+            (ShouldScorersCombinationMethod::Required(should_scorer), must_scorers) => {
+                // Required SHOULD: at least `minimum_number_should_match` must match.
+                // Semantics: (MUST constraint) AND (SHOULD constraint)
+                match effective_must_scorer(
+                    must_scorers,
+                    must_special_scorer_counts.num_all_scorers,
+                    reader.max_doc(),
+                    num_docs,
+                ) {
+                    None => {
+                        // No MUST constraint: SHOULD alone determines matching.
+                        should_scorer
+                    }
+                    Some(must_scorer) => {
+                        // Has MUST constraint: intersect MUST with SHOULD.
+                        let should_boxed =
+                            into_box_scorer(should_scorer, &score_combiner_fn, num_docs);
+                        SpecializedScorer::Other(intersect_scorers(
+                            vec![must_scorer, should_boxed],
+                            num_docs,
+                        ))
+                    }
+                }
             }
-            (CombinationMethod::Required(should_scorer), None) => {
-                SpecializedScorer::Other(should_scorer)
-            }
-            // Optional options are promoted to required if no must scorers exists.
-            (CombinationMethod::Optional(should_scorer), None) => should_scorer,
         };
-        if let Some(exclude_scorer) = exclude_scorer_opt {
-            let positive_scorer_boxed = into_box_scorer(positive_scorer, &score_combiner_fn);
-            Ok(SpecializedScorer::Other(Box::new(Exclude::new(
-                positive_scorer_boxed,
-                exclude_scorer,
-            ))))
-        } else {
-            Ok(positive_scorer)
+        if exclude_scorers.is_empty() {
+            return Ok(include_scorer);
         }
+
+        let include_scorer_boxed = into_box_scorer(include_scorer, &score_combiner_fn, num_docs);
+        let scorer: Box<dyn Scorer> = if exclude_scorers.len() == 1 {
+            let exclude_scorer = exclude_scorers.pop().unwrap();
+            match exclude_scorer.downcast::<TermScorer>() {
+                // Cast to TermScorer succeeded
+                Ok(exclude_scorer) => Box::new(Exclude::new(include_scorer_boxed, *exclude_scorer)),
+                // We get back the original Box<dyn Scorer>
+                Err(exclude_scorer) => Box::new(Exclude::new(include_scorer_boxed, exclude_scorer)),
+            }
+        } else {
+            Box::new(Exclude::new(include_scorer_boxed, exclude_scorers))
+        };
+        Ok(SpecializedScorer::Other(scorer))
     }
+}
+
+#[derive(Default, Copy, Clone, Debug)]
+struct AllAndEmptyScorerCounts {
+    num_all_scorers: usize,
+    num_empty_scorers: usize,
+}
+
+fn remove_and_count_all_and_empty_scorers(
+    scorers: &mut Vec<Box<dyn Scorer>>,
+) -> AllAndEmptyScorerCounts {
+    let mut counts = AllAndEmptyScorerCounts::default();
+    scorers.retain(|scorer| {
+        if scorer.is::<AllScorer>() {
+            counts.num_all_scorers += 1;
+            false
+        } else if scorer.is::<EmptyScorer>() {
+            counts.num_empty_scorers += 1;
+            false
+        } else {
+            true
+        }
+    });
+    counts
 }
 
 impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombiner> {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
+        let num_docs = reader.num_docs();
         if self.weights.is_empty() {
             Ok(Box::new(EmptyScorer))
         } else if self.weights.len() == 1 {
@@ -261,12 +470,12 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         } else if self.scoring_enabled {
             self.complex_scorer(reader, boost, &self.score_combiner_fn)
                 .map(|specialized_scorer| {
-                    into_box_scorer(specialized_scorer, &self.score_combiner_fn)
+                    into_box_scorer(specialized_scorer, &self.score_combiner_fn, num_docs)
                 })
         } else {
             self.complex_scorer(reader, boost, DoNothingCombiner::default)
                 .map(|specialized_scorer| {
-                    into_box_scorer(specialized_scorer, DoNothingCombiner::default)
+                    into_box_scorer(specialized_scorer, DoNothingCombiner::default, num_docs)
                 })
         }
     }
@@ -282,7 +491,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
 
         let mut explanation = Explanation::new("BooleanClause. sum of ...", scorer.score());
         for (occur, subweight) in &self.weights {
-            if is_positive_occur(*occur) {
+            if is_include_occur(*occur) {
                 if let Ok(child_explanation) = subweight.explain(reader, doc) {
                     explanation.add_detail(child_explanation);
                 }
@@ -297,11 +506,25 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         callback: &mut dyn FnMut(DocId, Score),
     ) -> crate::Result<()> {
         let scorer = self.complex_scorer(reader, 1.0, &self.score_combiner_fn)?;
+        let num_docs = reader.num_docs();
         match scorer {
-            SpecializedScorer::TermUnion(term_scorers) => {
-                let mut union_scorer =
-                    BufferedUnionScorer::build(term_scorers, &self.score_combiner_fn);
-                for_each_scorer(&mut union_scorer, callback);
+            SpecializedScorer::TermUnion(mut term_scorers) => {
+                if term_scorers.len() == 1 {
+                    let mut term_scorer = term_scorers.pop().unwrap();
+                    for_each_scorer(&mut term_scorer, callback);
+                } else {
+                    let mut union_scorer =
+                        BufferedUnionScorer::build(term_scorers, &self.score_combiner_fn, num_docs);
+                    for_each_scorer(&mut union_scorer, callback);
+                }
+            }
+            SpecializedScorer::TermIntersection(term_scorers) => {
+                let boxed_scorers: Vec<Box<dyn Scorer>> = term_scorers
+                    .into_iter()
+                    .map(|term_scorer| Box::new(term_scorer) as Box<dyn Scorer>)
+                    .collect();
+                let mut intersection = intersect_scorers(boxed_scorers, num_docs);
+                for_each_scorer(intersection.as_mut(), callback);
             }
             SpecializedScorer::Other(mut scorer) => {
                 for_each_scorer(scorer.as_mut(), callback);
@@ -316,13 +539,27 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         callback: &mut dyn FnMut(&[DocId]),
     ) -> crate::Result<()> {
         let scorer = self.complex_scorer(reader, 1.0, || DoNothingCombiner)?;
+        let num_docs = reader.num_docs();
         let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
 
         match scorer {
-            SpecializedScorer::TermUnion(term_scorers) => {
-                let mut union_scorer =
-                    BufferedUnionScorer::build(term_scorers, &self.score_combiner_fn);
-                for_each_docset_buffered(&mut union_scorer, &mut buffer, callback);
+            SpecializedScorer::TermUnion(mut term_scorers) => {
+                if term_scorers.len() == 1 {
+                    let mut term_scorer = term_scorers.pop().unwrap();
+                    for_each_docset_buffered(&mut term_scorer, &mut buffer, callback);
+                } else {
+                    let mut union_scorer =
+                        BufferedUnionScorer::build(term_scorers, &self.score_combiner_fn, num_docs);
+                    for_each_docset_buffered(&mut union_scorer, &mut buffer, callback);
+                }
+            }
+            SpecializedScorer::TermIntersection(term_scorers) => {
+                let boxed_scorers: Vec<Box<dyn Scorer>> = term_scorers
+                    .into_iter()
+                    .map(|term_scorer| Box::new(term_scorer) as Box<dyn Scorer>)
+                    .collect();
+                let mut intersection = intersect_scorers(boxed_scorers, num_docs);
+                for_each_docset_buffered(intersection.as_mut(), &mut buffer, callback);
             }
             SpecializedScorer::Other(mut scorer) => {
                 for_each_docset_buffered(scorer.as_mut(), &mut buffer, callback);
@@ -348,9 +585,27 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         callback: &mut dyn FnMut(DocId, Score) -> Score,
     ) -> crate::Result<()> {
         let scorer = self.complex_scorer(reader, 1.0, &self.score_combiner_fn)?;
+        let num_docs = reader.num_docs();
         match scorer {
+            // Block-WAND scores by summing the matching terms, so it may only
+            // drive a combiner that sums. Anything else (dis_max) still needs
+            // every matching term and falls back to the plain union.
             SpecializedScorer::TermUnion(term_scorers) => {
-                super::block_wand(term_scorers, threshold, callback);
+                if TScoreCombiner::SUPPORTS_BLOCK_WAND {
+                    super::block_wand(term_scorers, threshold, callback);
+                } else {
+                    let mut union_scorer =
+                        BufferedUnionScorer::build(term_scorers, &self.score_combiner_fn, num_docs);
+                    for_each_pruning_scorer(&mut union_scorer, threshold, callback);
+                }
+            }
+            // An intersection sums its term scores whatever the combiner:
+            // `Intersection::score` hard-codes the sum and `into_box_scorer`
+            // routes `TermIntersection` through it, so the combiner only ever
+            // shapes how *should* clauses combine. Block-WAND's summing
+            // therefore matches the unpruned scorer here for every combiner.
+            SpecializedScorer::TermIntersection(term_scorers) => {
+                super::block_wand_intersection(term_scorers, threshold, callback);
             }
             SpecializedScorer::Other(mut scorer) => {
                 for_each_pruning_scorer(scorer.as_mut(), threshold, callback);
@@ -360,7 +615,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
     }
 }
 
-fn is_positive_occur(occur: Occur) -> bool {
+fn is_include_occur(occur: Occur) -> bool {
     match occur {
         Occur::Must | Occur::Should => true,
         Occur::MustNot => false,

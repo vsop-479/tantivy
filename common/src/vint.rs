@@ -28,7 +28,9 @@ impl BinarySerializable for VIntU128 {
         writer.write_all(&buffer)
     }
 
+    #[allow(clippy::unbuffered_bytes)]
     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+        #[allow(clippy::unbuffered_bytes)]
         let mut bytes = reader.bytes();
         let mut result = 0u128;
         let mut shift = 0u64;
@@ -195,7 +197,9 @@ impl BinarySerializable for VInt {
         writer.write_all(&buffer[0..num_bytes])
     }
 
+    #[allow(clippy::unbuffered_bytes)]
     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+        #[allow(clippy::unbuffered_bytes)]
         let mut bytes = reader.bytes();
         let mut result = 0u64;
         let mut shift = 0u64;
@@ -222,7 +226,7 @@ impl BinarySerializable for VInt {
 #[cfg(test)]
 mod tests {
 
-    use super::{serialize_vint_u32, BinarySerializable, VInt};
+    use super::{BinarySerializable, VInt, serialize_vint_u32};
 
     fn aux_test_vint(val: u64) {
         let mut v = [14u8; 10];

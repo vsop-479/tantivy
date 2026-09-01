@@ -55,13 +55,10 @@ where W: Write
         }
 
         if num_field_values != actual_length {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "Unexpected number of entries written to serializer, expected \
-                     {num_field_values} entries, got {actual_length} entries",
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "Unexpected number of entries written to serializer, expected {num_field_values} \
+                 entries, got {actual_length} entries",
+            )));
         }
 
         Ok(())
@@ -136,6 +133,12 @@ where W: Write
                     self.write_type_code(type_codes::EXT_CODE)?;
                     self.serialize_with_type_code(type_codes::TOK_STR_EXT_CODE, &*val)
                 }
+                // Custom fields are never stored (`is_stored() == false`), so the document
+                // serializer never reaches this arm. Guard it explicitly rather than inventing an
+                // on-disk type code for an opaque, plugin-owned payload.
+                ReferenceValueLeaf::Custom(_) => Err(io::Error::other(
+                    "the store does not support custom field types",
+                )),
             },
             ReferenceValue::Array(elements) => {
                 self.write_type_code(type_codes::ARRAY_CODE)?;
@@ -215,14 +218,11 @@ where W: Write
     /// Finishes writing the array to the writer and validates it.
     pub(crate) fn end(self) -> io::Result<()> {
         if self.expected_length != self.actual_length {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "Unexpected number of entries written to serializer, expected {} entries, got \
-                     {} entries",
-                    self.expected_length, self.actual_length,
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "Unexpected number of entries written to serializer, expected {} entries, got {} \
+                 entries",
+                self.expected_length, self.actual_length,
+            )));
         }
         Ok(())
     }
@@ -276,14 +276,11 @@ where W: Write
     /// Finishes writing the array to the writer and validates it.
     pub(crate) fn end(self) -> io::Result<()> {
         if self.expected_length != self.actual_length {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "Unexpected number of entries written to serializer, expected {} entries, got \
-                     {} entries",
-                    self.expected_length, self.actual_length,
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "Unexpected number of entries written to serializer, expected {} entries, got {} \
+                 entries",
+                self.expected_length, self.actual_length,
+            )));
         }
 
         // This should never fail if the above statement is valid.

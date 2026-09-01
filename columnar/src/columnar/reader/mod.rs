@@ -1,11 +1,11 @@
 use std::{fmt, io, mem};
 
+use common::BinarySerializable;
 use common::file_slice::FileSlice;
 use common::json_path_writer::JSON_PATH_SEGMENT_SEP;
-use common::BinarySerializable;
 use sstable::{Dictionary, RangeSSTable};
 
-use crate::columnar::{format_version, ColumnType};
+use crate::columnar::{ColumnType, format_version};
 use crate::dynamic_column::DynamicColumnHandle;
 use crate::{RowId, Version};
 
@@ -19,13 +19,13 @@ fn io_invalid_data(msg: String) -> io::Error {
 pub struct ColumnarReader {
     column_dictionary: Dictionary<RangeSSTable>,
     column_data: FileSlice,
-    num_rows: RowId,
+    num_docs: RowId,
     format_version: Version,
 }
 
 impl fmt::Debug for ColumnarReader {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let num_rows = self.num_rows();
+        let num_rows = self.num_docs();
         let columns = self.list_columns().unwrap();
         let num_cols = columns.len();
         let mut debug_struct = f.debug_struct("Columnar");
@@ -112,13 +112,13 @@ impl ColumnarReader {
         Ok(ColumnarReader {
             column_dictionary,
             column_data,
-            num_rows,
+            num_docs: num_rows,
             format_version,
         })
     }
 
-    pub fn num_rows(&self) -> RowId {
-        self.num_rows
+    pub fn num_docs(&self) -> RowId {
+        self.num_docs
     }
     // Iterate over the columns in a sorted way
     pub fn iter_columns(
@@ -226,7 +226,7 @@ mod tests {
         columnar_writer.record_column_type("col1", ColumnType::Str, false);
         columnar_writer.record_column_type("col2", ColumnType::U64, false);
         let mut buffer = Vec::new();
-        columnar_writer.serialize(1, &mut buffer).unwrap();
+        columnar_writer.serialize(1, None, &mut buffer).unwrap();
         let columnar = ColumnarReader::open(buffer).unwrap();
         let columns = columnar.list_columns().unwrap();
         assert_eq!(columns.len(), 2);
@@ -242,7 +242,7 @@ mod tests {
         columnar_writer.record_column_type("count", ColumnType::U64, false);
         columnar_writer.record_numerical(1, "count", 1u64);
         let mut buffer = Vec::new();
-        columnar_writer.serialize(2, &mut buffer).unwrap();
+        columnar_writer.serialize(2, None, &mut buffer).unwrap();
         let columnar = ColumnarReader::open(buffer).unwrap();
         let columns = columnar.list_columns().unwrap();
         assert_eq!(columns.len(), 1);
@@ -256,7 +256,7 @@ mod tests {
         columnar_writer.record_column_type("col", ColumnType::U64, false);
         columnar_writer.record_numerical(1, "col", 1u64);
         let mut buffer = Vec::new();
-        columnar_writer.serialize(2, &mut buffer).unwrap();
+        columnar_writer.serialize(2, None, &mut buffer).unwrap();
         let columnar = ColumnarReader::open(buffer).unwrap();
         {
             let columns = columnar.read_columns("col").unwrap();
@@ -285,7 +285,7 @@ mod tests {
         columnar_writer.record_str(1, "col1", "hello");
         columnar_writer.record_str(0, "col2", "hello");
         let mut buffer = Vec::new();
-        columnar_writer.serialize(2, &mut buffer).unwrap();
+        columnar_writer.serialize(2, None, &mut buffer).unwrap();
 
         let columnar = ColumnarReader::open(buffer).unwrap();
         {

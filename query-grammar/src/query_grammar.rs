@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 use std::iter::once;
 
+use fnv::FnvHashSet;
+use nom::IResult;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::{
@@ -10,12 +12,11 @@ use nom::combinator::{eof, map, map_res, opt, peek, recognize, value, verify};
 use nom::error::{Error, ErrorKind};
 use nom::multi::{many0, many1, separated_list0};
 use nom::sequence::{delimited, preceded, separated_pair, terminated, tuple};
-use nom::IResult;
 
 use super::user_input_ast::{UserInputAst, UserInputBound, UserInputLeaf, UserInputLiteral};
+use crate::Occur;
 use crate::infallible::*;
 use crate::user_input_ast::Delimiter;
-use crate::Occur;
 
 // Note: '-' char is only forbidden at the beginning of a field name, would be clearer to add it to
 // special characters.
@@ -36,7 +37,7 @@ fn field_name(inp: &str) -> IResult<&str, String> {
                 alt((first_char, escape_sequence())),
                 many0(alt((simple_char, escape_sequence(), char('\\')))),
             )),
-            char(':'),
+            tuple((multispace0, char(':'), multispace0)),
         ),
         |(first_char, next)| once(first_char).chain(next).collect(),
     )(inp)
@@ -68,7 +69,7 @@ fn interpret_escape(source: &str) -> String {
 
 /// Consume a word outside of any context.
 // TODO should support escape sequences
-fn word(inp: &str) -> IResult<&str, Cow<str>> {
+fn word(inp: &str) -> IResult<&str, Cow<'_, str>> {
     map_res(
         recognize(tuple((
             alt((
@@ -305,15 +306,14 @@ fn term_group_infallible(inp: &str) -> JResult<&str, UserInputAst> {
     let (inp, (field_name, _, _, _)) =
         tuple((field_name, multispace0, char('('), multispace0))(inp).expect("precondition failed");
 
-    let res = delimited_infallible(
+    delimited_infallible(
         nothing,
         map(ast_infallible, |(mut ast, errors)| {
             ast.set_default_field(field_name.to_string());
             (ast, errors)
         }),
         opt_i_err(char(')'), "expected ')'"),
-    )(inp);
-    res
+    )(inp)
 }
 
 fn exists(inp: &str) -> IResult<&str, UserInputLeaf> {
@@ -321,7 +321,19 @@ fn exists(inp: &str) -> IResult<&str, UserInputLeaf> {
         UserInputLeaf::Exists {
             field: String::new(),
         },
-        tuple((multispace0, char('*'))),
+        tuple((
+            multispace0,
+            char('*'),
+            peek(alt((
+                value(
+                    "",
+                    satisfy(|c: char| {
+                        c.is_whitespace() || (ESCAPE_IN_WORD.contains(&c) && c != '\\')
+                    }),
+                ),
+                eof,
+            ))),
+        )),
     )(inp)
 }
 
@@ -331,7 +343,16 @@ fn exists_precond(inp: &str) -> IResult<&str, (), ()> {
         peek(tuple((
             field_name,
             multispace0,
-            char('*'), // when we are here, we know it can't be anything but a exists
+            char('*'),
+            peek(alt((
+                value(
+                    "",
+                    satisfy(|c: char| {
+                        c.is_whitespace() || (ESCAPE_IN_WORD.contains(&c) && c != '\\')
+                    }),
+                ),
+                eof,
+            ))), // we need to check this isn't a wildcard query
         ))),
     )(inp)
     .map_err(|e| e.map(|_| ()))
@@ -350,7 +371,10 @@ fn literal(inp: &str) -> IResult<&str, UserInputAst> {
     // something (a field name) got parsed before
     alt((
         map(
-            tuple((opt(field_name), alt((range, set, exists, term_or_phrase)))),
+            tuple((
+                opt(field_name),
+                alt((range, set, exists, regex, term_or_phrase)),
+            )),
             |(field_name, leaf): (Option<String>, UserInputLeaf)| leaf.set_field(field_name).into(),
         ),
         term_group,
@@ -371,6 +395,10 @@ fn literal_no_group_infallible(inp: &str) -> JResult<&str, Option<UserInputAst>>
                     (
                         value((), peek(one_of("{[><"))),
                         map(range_infallible, |(range, errs)| (Some(range), errs)),
+                    ),
+                    (
+                        value((), peek(one_of("/"))),
+                        map(regex_infallible, |(regex, errs)| (Some(regex), errs)),
                     ),
                 ),
                 delimited_infallible(space0_infallible, term_or_phrase_infallible, nothing),
@@ -536,7 +564,7 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
             (
                 (
                     value((), tag(">=")),
-                    map(word_infallible("", false), |(bound, err)| {
+                    map(word_infallible(")", false), |(bound, err)| {
                         (
                             (
                                 bound
@@ -550,7 +578,7 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
                 ),
                 (
                     value((), tag("<=")),
-                    map(word_infallible("", false), |(bound, err)| {
+                    map(word_infallible(")", false), |(bound, err)| {
                         (
                             (
                                 UserInputBound::Unbounded,
@@ -564,7 +592,7 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
                 ),
                 (
                     value((), tag(">")),
-                    map(word_infallible("", false), |(bound, err)| {
+                    map(word_infallible(")", false), |(bound, err)| {
                         (
                             (
                                 bound
@@ -578,7 +606,7 @@ fn range_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
                 ),
                 (
                     value((), tag("<")),
-                    map(word_infallible("", false), |(bound, err)| {
+                    map(word_infallible(")", false), |(bound, err)| {
                         (
                             (
                                 UserInputBound::Unbounded,
@@ -672,6 +700,71 @@ fn set_infallible(mut inp: &str) -> JResult<&str, UserInputLeaf> {
     }
 }
 
+fn regex(inp: &str) -> IResult<&str, UserInputLeaf> {
+    map(
+        terminated(
+            delimited(
+                char('/'),
+                many1(alt((preceded(char('\\'), char('/')), none_of("/")))),
+                char('/'),
+            ),
+            peek(alt((
+                value((), multispace1),
+                value((), char(')')),
+                value((), char('^')),
+                value((), eof),
+            ))),
+        ),
+        |elements| UserInputLeaf::Regex {
+            field: None,
+            pattern: elements.into_iter().collect::<String>(),
+        },
+    )(inp)
+}
+
+fn regex_infallible(inp: &str) -> JResult<&str, UserInputLeaf> {
+    match terminated_infallible(
+        delimited_infallible(
+            opt_i_err(char('/'), "missing delimiter /"),
+            opt_i(many1(alt((preceded(char('\\'), char('/')), none_of("/"))))),
+            opt_i_err(char('/'), "missing delimiter /"),
+        ),
+        opt_i_err(
+            peek(alt((
+                value((), multispace1),
+                value((), char(')')),
+                value((), char('^')),
+                value((), eof),
+            ))),
+            "expected whitespace, closing parenthesis, boost, or end of input",
+        ),
+    )(inp)
+    {
+        Ok((rest, (elements_part, errors))) => {
+            let pattern = match elements_part {
+                Some(elements_part) => elements_part.into_iter().collect(),
+                None => String::new(),
+            };
+            let res = UserInputLeaf::Regex {
+                field: None,
+                pattern,
+            };
+            Ok((rest, (res, errors)))
+        }
+        Err(e) => {
+            let errs = vec![LenientErrorInternal {
+                pos: inp.len(),
+                message: e.to_string(),
+            }];
+            let res = UserInputLeaf::Regex {
+                field: None,
+                pattern: String::new(),
+            };
+            Ok((inp, (res, errs)))
+        }
+    }
+}
+
 fn negate(expr: UserInputAst) -> UserInputAst {
     expr.unary(Occur::MustNot)
 }
@@ -679,7 +772,21 @@ fn negate(expr: UserInputAst) -> UserInputAst {
 fn leaf(inp: &str) -> IResult<&str, UserInputAst> {
     alt((
         delimited(char('('), ast, char(')')),
-        map(char('*'), |_| UserInputAst::from(UserInputLeaf::All)),
+        map(
+            terminated(
+                char('*'),
+                peek(alt((
+                    value((), multispace1),
+                    value((), char(')')),
+                    value((), eof),
+                    value(
+                        (),
+                        satisfy(|c: char| ESCAPE_IN_WORD.contains(&c) && c != '\\'),
+                    ),
+                ))),
+            ),
+            |_| UserInputAst::from(UserInputLeaf::All),
+        ),
         map(preceded(tuple((tag("NOT"), multispace1)), leaf), negate),
         literal,
     ))(inp)
@@ -700,7 +807,21 @@ fn leaf_infallible(inp: &str) -> JResult<&str, Option<UserInputAst>> {
                 ),
             ),
             (
-                value((), char('*')),
+                value(
+                    (),
+                    terminated(
+                        char('*'),
+                        peek(alt((
+                            value((), multispace1),
+                            value((), char(')')),
+                            value((), eof),
+                            value(
+                                (),
+                                satisfy(|c: char| ESCAPE_IN_WORD.contains(&c) && c != '\\'),
+                            ),
+                        ))),
+                    ),
+                ),
                 map(nothing, |_| {
                     (Some(UserInputAst::from(UserInputLeaf::All)), Vec::new())
                 }),
@@ -736,7 +857,7 @@ fn boosted_leaf(inp: &str) -> IResult<&str, UserInputAst> {
         tuple((leaf, fallible(boost))),
         |(leaf, boost_opt)| match boost_opt {
             Some(boost) if (boost - 1.0).abs() > f64::EPSILON => {
-                UserInputAst::Boost(Box::new(leaf), boost)
+                UserInputAst::Boost(Box::new(leaf), boost.into())
             }
             _ => leaf,
         },
@@ -748,7 +869,7 @@ fn boosted_leaf_infallible(inp: &str) -> JResult<&str, Option<UserInputAst>> {
         tuple_infallible((leaf_infallible, boost)),
         |((leaf, boost_opt), error)| match boost_opt {
             Some(boost) if (boost - 1.0).abs() > f64::EPSILON => (
-                leaf.map(|leaf| UserInputAst::Boost(Box::new(leaf), boost)),
+                leaf.map(|leaf| UserInputAst::Boost(Box::new(leaf), boost.into())),
                 error,
             ),
             _ => (leaf, error),
@@ -938,18 +1059,43 @@ fn operand_leaf(inp: &str) -> IResult<&str, (Option<BinaryOperand>, Option<Occur
 }
 
 fn ast(inp: &str) -> IResult<&str, UserInputAst> {
-    let boolean_expr = map_res(
-        separated_pair(occur_leaf, multispace1, many1(operand_leaf)),
-        |(left, right)| aggregate_binary_expressions(left, right),
-    );
-    let single_leaf = map(occur_leaf, |(occur, ast)| {
-        if occur == Some(Occur::MustNot) {
-            ast.unary(Occur::MustNot)
-        } else {
-            ast
-        }
-    });
-    delimited(multispace0, alt((boolean_expr, single_leaf)), multispace0)(inp)
+    // Parse `occur_leaf` once, then conditionally extend into a boolean
+    // expression. The previous implementation used `alt((boolean_expr,
+    // single_leaf))` which, when the input was a single leaf with no
+    // following operand, would parse `occur_leaf` once for `boolean_expr`,
+    // fail at `multispace1`, backtrack, then re-parse `occur_leaf` for
+    // `single_leaf`. With recursively-nested groups like `(+(+(+a)))`, that
+    // doubling at every level produced O(2^n) parse time. Parsing once and
+    // peeking ahead for the operand keeps it O(n).
+    delimited(
+        multispace0,
+        |inp| {
+            let (rest, first) = occur_leaf(inp)?;
+            // Only fall back on `Err::Error` (recoverable), mirroring
+            // `alt`'s behaviour. `Err::Failure` and `Err::Incomplete`
+            // must propagate so cut points and streaming needs are not
+            // accidentally swallowed if they are ever introduced in the
+            // operand parsers.
+            match preceded(multispace1, many1(operand_leaf))(rest) {
+                Ok((rest, more)) => {
+                    let combined = aggregate_binary_expressions(first, more)
+                        .map_err(|_| nom::Err::Error(Error::new(inp, ErrorKind::MapRes)))?;
+                    Ok((rest, combined))
+                }
+                Err(nom::Err::Error(_)) => {
+                    let (occur, ast) = first;
+                    let single = if occur == Some(Occur::MustNot) {
+                        ast.unary(Occur::MustNot)
+                    } else {
+                        ast
+                    };
+                    Ok((rest, single))
+                }
+                Err(e) => Err(e),
+            }
+        },
+        multispace0,
+    )(inp)
 }
 
 fn ast_infallible(inp: &str) -> JResult<&str, UserInputAst> {
@@ -999,12 +1145,25 @@ pub fn parse_to_ast_lenient(query_str: &str) -> (UserInputAst, Vec<LenientError>
     (rewrite_ast(res), errors)
 }
 
-/// Removes unnecessary children clauses in AST
-///
-/// Motivated by [issue #1433](https://github.com/quickwit-oss/tantivy/issues/1433)
 fn rewrite_ast(mut input: UserInputAst) -> UserInputAst {
-    if let UserInputAst::Clause(terms) = &mut input {
-        for term in terms {
+    if let UserInputAst::Clause(sub_clauses) = &mut input {
+        // call rewrite_ast recursively on children clauses if applicable
+        let mut new_clauses = Vec::with_capacity(sub_clauses.len());
+        for (occur, clause) in sub_clauses.drain(..) {
+            let rewritten_clause = rewrite_ast(clause);
+            new_clauses.push((occur, rewritten_clause));
+        }
+        *sub_clauses = new_clauses;
+
+        // remove duplicate child clauses
+        // e.g. (+a +b) OR (+c +d) OR (+a +b)  => (+a +b) OR (+c +d)
+        let mut seen = FnvHashSet::default();
+        sub_clauses.retain(|term| seen.insert(term.clone()));
+
+        // Removes unnecessary children clauses in AST
+        //
+        // Motivated by [issue #1433](https://github.com/quickwit-oss/tantivy/issues/1433)
+        for term in sub_clauses {
             rewrite_ast_clause(term);
         }
     }
@@ -1013,7 +1172,7 @@ fn rewrite_ast(mut input: UserInputAst) -> UserInputAst {
 
 fn rewrite_ast_clause(input: &mut (Option<Occur>, UserInputAst)) {
     match input {
-        (None, UserInputAst::Clause(ref mut clauses)) if clauses.len() == 1 => {
+        (None, UserInputAst::Clause(clauses)) if clauses.len() == 1 => {
             *input = clauses.pop().unwrap(); // safe because clauses.len() == 1
         }
         _ => {}
@@ -1211,6 +1370,14 @@ mod test {
         test_parse_query_to_ast_helper("<a", "{\"*\" TO \"a\"}");
         test_parse_query_to_ast_helper("<=a", "{\"*\" TO \"a\"]");
         test_parse_query_to_ast_helper("<=bsd", "{\"*\" TO \"bsd\"]");
+
+        test_parse_query_to_ast_helper("(<=42)", "{\"*\" TO \"42\"]");
+        test_parse_query_to_ast_helper("(<=42 )", "{\"*\" TO \"42\"]");
+        test_parse_query_to_ast_helper("(age:>5)", "\"age\":{\"5\" TO \"*\"}");
+        test_parse_query_to_ast_helper(
+            "(title:bar AND age:>12)",
+            "(+\"title\":bar +\"age\":{\"12\" TO \"*\"})",
+        );
     }
 
     #[test]
@@ -1265,6 +1432,10 @@ mod test {
         assert_eq!(
             super::field_name("~my~field:a"),
             Ok(("a", "~my~field".to_string()))
+        );
+        assert_eq!(
+            super::field_name(".my.field.name : a"),
+            Ok(("a", ".my.field.name".to_string()))
         );
         for special_char in SPECIAL_CHARS.iter() {
             let query = &format!("\\{special_char}my\\{special_char}field:a");
@@ -1359,7 +1530,7 @@ mod test {
 
     #[test]
     fn test_range_parser_lenient() {
-        let literal = |query| literal_infallible(query).unwrap().1 .0.unwrap();
+        let literal = |query| literal_infallible(query).unwrap().1.0.unwrap();
 
         // same tests as non-lenient
         let res = literal("title: <hello");
@@ -1575,6 +1746,27 @@ mod test {
         test_parse_query_to_ast_helper("abc:a b", "(*\"abc\":a *b)");
         test_parse_query_to_ast_helper("abc:\"a b\"", "\"abc\":\"a b\"");
         test_parse_query_to_ast_helper("foo:[1 TO 5]", "\"foo\":[\"1\" TO \"5\"]");
+
+        // Phrase prefixed with *
+        test_parse_query_to_ast_helper("foo:(*A)", "\"foo\":*A");
+        test_parse_query_to_ast_helper("*A", "*A");
+        test_parse_query_to_ast_helper("(*A)", "*A");
+        test_parse_query_to_ast_helper("foo:(A OR B)", "(?\"foo\":A ?\"foo\":B)");
+        test_parse_query_to_ast_helper("foo:(A* OR B*)", "(?\"foo\":A* ?\"foo\":B*)");
+        test_parse_query_to_ast_helper("foo:(*A OR *B)", "(?\"foo\":*A ?\"foo\":*B)");
+
+        // Regexes between parentheses
+        test_parse_query_to_ast_helper("foo:(/A.*/)", "\"foo\":/A.*/");
+        test_parse_query_to_ast_helper("foo:(/A.*/ OR /B.*/)", "(?\"foo\":/A.*/ ?\"foo\":/B.*/)");
+    }
+
+    #[test]
+    fn test_parse_query_all() {
+        test_parse_query_to_ast_helper("*", "*");
+        test_parse_query_to_ast_helper("(*)", "*");
+        test_parse_query_to_ast_helper("(* )", "*");
+        // All query with boost
+        test_parse_query_to_ast_helper("*^2", "(*)^2");
     }
 
     #[test]
@@ -1624,13 +1816,20 @@ mod test {
 
     #[test]
     fn test_exist_query() {
-        test_parse_query_to_ast_helper("a:*", "\"a\":*");
-        test_parse_query_to_ast_helper("a: *", "\"a\":*");
-        // an exist followed by default term being b
-        test_is_parse_err("a:*b", "(*\"a\":* *b)");
+        test_parse_query_to_ast_helper("a:*", "$exists(\"a\")");
+        test_parse_query_to_ast_helper("a: *", "$exists(\"a\")");
 
-        // this is a term query (not a phrase prefix)
+        test_parse_query_to_ast_helper(
+            "(hello AND toto:*) OR happy",
+            "(?(+hello +$exists(\"toto\")) ?happy)",
+        );
+        test_parse_query_to_ast_helper("(a:*)", "$exists(\"a\")");
+
+        // these are term/wildcard query (not a phrase prefix)
         test_parse_query_to_ast_helper("a:b*", "\"a\":b*");
+        test_parse_query_to_ast_helper("a:*b", "\"a\":*b");
+        test_parse_query_to_ast_helper(r#"a:*def*"#, "\"a\":*def*");
+        test_parse_query_to_ast_helper("a:*\\:foo", "\"a\":*:foo");
     }
 
     #[test]
@@ -1665,5 +1864,94 @@ mod test {
     #[test]
     fn test_invalid_field() {
         test_is_parse_err(r#"!bc:def"#, "!bc:def");
+    }
+
+    #[test]
+    fn test_regex_parser() {
+        let r = parse_to_ast(r#"a:/joh?n(ath[oa]n)/"#);
+        assert!(r.is_ok(), "Failed to parse custom query: {r:?}");
+        let (_, input) = r.unwrap();
+        match input {
+            UserInputAst::Leaf(leaf) => match leaf.as_ref() {
+                UserInputLeaf::Regex { field, pattern } => {
+                    assert_eq!(field, &Some("a".to_string()));
+                    assert_eq!(pattern, "joh?n(ath[oa]n)");
+                }
+                _ => panic!("Expected a regex leaf, got {leaf:?}"),
+            },
+            _ => panic!("Expected a leaf"),
+        }
+        let r = parse_to_ast(r#"a:/\\/cgi-bin\\/luci.*/"#);
+        assert!(r.is_ok(), "Failed to parse custom query: {r:?}");
+        let (_, input) = r.unwrap();
+        match input {
+            UserInputAst::Leaf(leaf) => match leaf.as_ref() {
+                UserInputLeaf::Regex { field, pattern } => {
+                    assert_eq!(field, &Some("a".to_string()));
+                    assert_eq!(pattern, "\\/cgi-bin\\/luci.*");
+                }
+                _ => panic!("Expected a regex leaf, got {leaf:?}"),
+            },
+            _ => panic!("Expected a leaf"),
+        }
+        // Regex followed by `^boost`
+        test_parse_query_to_ast_helper(r#"foo:/bar/^2"#, r#"("foo":/bar/)^2"#);
+    }
+
+    #[test]
+    fn test_regex_parser_lenient() {
+        let literal = |query| literal_infallible(query).unwrap().1;
+
+        let (res, errs) = literal(r#"a:/joh?n(ath[oa]n)/"#);
+        let expected = UserInputLeaf::Regex {
+            field: Some("a".to_string()),
+            pattern: "joh?n(ath[oa]n)".to_string(),
+        }
+        .into();
+        assert_eq!(res.unwrap(), expected);
+        assert!(errs.is_empty(), "Expected no errors, got: {errs:?}");
+
+        let (res, errs) = literal("title:/joh?n(ath[oa]n)");
+        let expected = UserInputLeaf::Regex {
+            field: Some("title".to_string()),
+            pattern: "joh?n(ath[oa]n)".to_string(),
+        }
+        .into();
+        assert_eq!(res.unwrap(), expected);
+        assert_eq!(errs.len(), 1, "Expected 1 error, got: {errs:?}");
+        assert_eq!(
+            errs[0].message, "missing delimiter /",
+            "Unexpected error message",
+        );
+    }
+
+    #[test]
+    fn test_space_before_value() {
+        test_parse_query_to_ast_helper("field : a", r#""field":a"#);
+        test_parse_query_to_ast_helper("field:    a", r#""field":a"#);
+        test_parse_query_to_ast_helper("field         :a", r#""field":a"#);
+        test_parse_query_to_ast_helper(
+            "field : 'happy tax payer' AND other_field  : 1",
+            r#"(+"field":'happy tax payer' +"other_field":1)"#,
+        );
+    }
+
+    // Regression test for https://github.com/quickwit-oss/tantivy/issues/2498:
+    // deeply nested parenthesized queries used to take O(2^n) time because the
+    // top-level `ast()` parser tried `boolean_expr` first and re-parsed the
+    // inner `occur_leaf` when it backtracked to `single_leaf`. Depth 60 would
+    // take ~10^18 operations under the regression; with the fix it parses
+    // instantly. We use `test_parse_query_to_ast_helper` so this test would
+    // never finish if the regression returned.
+    #[test]
+    fn test_parse_deeply_nested_query() {
+        let depth = 60;
+        let leading: String = "(".repeat(depth);
+        let trailing: String = ")".repeat(depth);
+        let query = format!("{leading}title:test{trailing}");
+        test_parse_query_to_ast_helper(&query, r#""title":test"#);
+
+        let query_with_plus = format!("+{leading}title:test{trailing}");
+        test_parse_query_to_ast_helper(&query_with_plus, r#""title":test"#);
     }
 }
